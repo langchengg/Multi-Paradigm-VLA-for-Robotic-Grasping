@@ -9,6 +9,17 @@ This demonstrates the ability to design custom simulation environments
 for VLA evaluation — a key differentiator for the project.
 """
 
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from envs._rendering import configure_headless_rendering, create_renderer
+else:
+    from ._rendering import configure_headless_rendering, create_renderer
+
+configure_headless_rendering()
+
 import mujoco
 import numpy as np
 from PIL import Image
@@ -165,8 +176,11 @@ class SimpleGraspEnv:
         self.camera_name = camera_name
 
         # Create renderer
-        self.renderer = mujoco.Renderer(
-            self.model, height=image_size, width=image_size
+        self.renderer = create_renderer(
+            mujoco,
+            self.model,
+            height=image_size,
+            width=image_size,
         )
 
         # Cache joint/body ids

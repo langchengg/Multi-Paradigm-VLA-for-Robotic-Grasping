@@ -24,6 +24,7 @@ This notebook:
 # ═══════════════════════════════════════════════════════════════
 
 import subprocess, sys
+from pathlib import Path
 
 def install():
     pkgs = ["mujoco>=3.0.0", "transformers>=4.40.0", "torch>=2.0.0",
@@ -39,6 +40,10 @@ install()
 import os
 os.environ["MUJOCO_GL"] = "osmesa"
 os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import math
 import time
@@ -404,7 +409,7 @@ print(f"\n✅ Training complete! Final loss: {train_losses[-1]:.4f}")
 # In practice, copy-paste the class from Notebook 1.
 # For this code, we use a compact version:
 
-from notebooks.simplified_env import SimpleGraspEnv  # or paste class directly
+from envs.simple_grasp_env import SimpleGraspEnv
 
 # If running standalone, paste the SimpleGraspEnv class from Notebook 1 here.
 

@@ -154,11 +154,18 @@ cd Multi-Paradigm-VLA-for-Robotic-Grasping
 pip install -r requirements.txt
 ```
 
+Headless Linux / Kaggle also needs native off-screen rendering libraries:
+
+```bash
+apt-get update -qq && apt-get install -y -qq \
+  libgl1-mesa-glx libgl1-mesa-dev libosmesa6-dev libglew-dev patchelf
+```
+
 ### Step 1: Verify Environment (10 seconds)
 
 ```bash
 # Test the Franka Panda environment loads correctly
-python envs/franka_grasp_env.py
+python -m envs.franka_grasp_env
 ```
 
 You should see:
