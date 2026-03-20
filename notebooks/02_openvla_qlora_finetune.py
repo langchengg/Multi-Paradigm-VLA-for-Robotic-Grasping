@@ -25,21 +25,21 @@ This notebook:
 import subprocess, sys
 
 def install():
-    pkgs = [
+        # Official OpenVLA dependencies
+        "torch==2.2.0",
+        "torchvision==0.17.0",
         "transformers==4.40.1",
         "tokenizers==0.19.1",
+        "accelerate==0.30.1",
+        "peft==0.11.1",
+        "bitsandbytes==0.43.1",
         "timm==0.9.10",
-        "accelerate>=0.27.0",
-        "peft>=0.10.0",
-        "bitsandbytes>=0.43.0",
-        "torch>=2.0.0",
-        "Pillow>=9.0.0",
         "numpy>=1.24.0",
         "wandb",
         "datasets", # For HuggingFace LIBERO datasets
     ]
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
-    print("✅ Dependencies installed")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + pkgs)
+    print("✅ Official OpenVLA Dependencies installed")
 
 install()
 
