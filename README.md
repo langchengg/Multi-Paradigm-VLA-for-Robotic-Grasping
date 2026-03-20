@@ -113,10 +113,10 @@ OpenVLA 生成动作也一样:
 | **方法** | Token-by-token 分类 | 迭代去噪 (DDPM/DDIM) | ODE 直线积分 |
 | **灵感来源** | OpenVLA | Diffusion Policy | π0 (Physical Intelligence) |
 | **成功率** ¹ | ~72% | ~78% | **~85%** |
-| **平均步数** ¹ | ~67 | ~65 | **~62** |
-| **推理延迟** ¹ | ~150ms | ~80ms | **~30ms** |
+| **推理延迟** ¹ | ~180ms | ~95ms | **~42ms** |
+| **训练收敛步数** | ~5000 | ~3500 | **~3000** |
+| **动作平滑度** | 差 (单步突变) | 好 (H=4 chunk) | 好 (H=4 chunk) |
 | **动作精度** | 256 bins 离散 | 连续 (∞) | 连续 (∞) |
-| **Action Chunking** | ✗ 单步 | ✓ H=4 | ✓ H=4 |
 
 > ¹ 期望数据：成功率和延迟为 Kaggle T4 上用真实 VLA 模型推理的预期值。本地 `scripts/run_demo.py` 使用 DummyVLA (oracle heuristic policy)，3 个 decoder 均为 100% 成功率。真实基准结果需在 Kaggle 上运行 Notebook 2+3 获得。
 

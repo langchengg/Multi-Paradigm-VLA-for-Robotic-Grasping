@@ -29,9 +29,9 @@ class DummyVLA:
     """
 
     DECODER_LATENCIES = {
-        "autoregressive": 0.15,  # ~150ms (slowest, token-by-token)
-        "diffusion": 0.08,      # ~80ms (10 denoising steps)
-        "flow_matching": 0.03,  # ~30ms (fastest, few ODE steps)
+        "autoregressive": 0.18,  # 180ms (slowest, token-by-token)
+        "diffusion": 0.095,      # 95ms (10 denoising steps)
+        "flow_matching": 0.042,  # 42ms (fastest, 10 ODE steps)
     }
 
     def __init__(self, decoder_type="flow_matching", action_dim=7, simulate_latency=False):

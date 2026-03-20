@@ -81,7 +81,7 @@ TRAIN_EPOCHS = 30
 BATCH_SIZE = 16
 LEARNING_RATE = 3e-4
 IMAGE_SIZE = 224
-ACTION_DIM = 4       # dx, dy, dz, gripper
+ACTION_DIM = 7       # dx, dy, dz, dax, day, daz, gripper
 ACTION_HORIZON = 4   # predict 4 future actions (action chunking)
 
 # ═══════════════════════════════════════════════════════════════
