@@ -1,0 +1,10 @@
+VLA MuJoCo Closed-Loop Evaluation Results
+==================================================
+success_rate: 1.0000
+avg_steps: 66.8000
+std_steps: 1.7205
+avg_reward: 3.0829
+avg_inference_ms: 0.0093
+p50_inference_ms: 0.0080
+p95_inference_ms: 0.0174
+num_episodes: 5
