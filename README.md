@@ -149,8 +149,8 @@ OpenVLA 生成动作也一样:
 ### Step 0: Clone and Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/vla-robotic-grasping.git
-cd vla-robotic-grasping
+git clone https://github.com/langchengg/Multi-Paradigm-VLA-for-Robotic-Grasping.git
+cd Multi-Paradigm-VLA-for-Robotic-Grasping
 pip install -r requirements.txt
 ```
 
