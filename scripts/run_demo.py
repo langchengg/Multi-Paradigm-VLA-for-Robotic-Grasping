@@ -17,12 +17,30 @@ import os
 import sys
 import time
 import argparse
+import zipfile
 import numpy as np
 from pathlib import Path
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def package_assets_dir(assets_dir, archive_path):
+    """Package the contents of assets_dir into a zip archive."""
+    assets_dir = Path(assets_dir)
+    archive_path = Path(archive_path)
+
+    if not assets_dir.exists():
+        raise FileNotFoundError(f"Assets directory does not exist: {assets_dir}")
+
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(assets_dir.rglob("*")):
+            if path.is_file():
+                zf.write(path, arcname=path.relative_to(assets_dir))
+
+    return archive_path
 
 
 def main(quick=False, use_simple=False):
@@ -227,6 +245,13 @@ def main(quick=False, use_simple=False):
         s = result["summary"]
         print(f"    {name}: success={s['success_rate']:.0%}, "
               f"latency={s['p50_inference_ms']:.1f}ms")
+
+    archive_name = "assets_quick.zip" if quick else "assets_full.zip"
+    if use_simple:
+        archive_name = archive_name.replace("assets_", "assets_simple_")
+    archive_path = package_assets_dir(assets_dir, PROJECT_ROOT / archive_name)
+    archive_size_kb = archive_path.stat().st_size / 1024
+    print(f"\n  📦 Packaged assets: {archive_path} ({archive_size_kb:.1f} KB)")
 
     env.close()
     print(f"\n✅ All done!")

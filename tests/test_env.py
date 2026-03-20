@@ -1,7 +1,7 @@
 """
 Environment Unit Tests
 ======================
-Tests for SimpleGraspEnv and data collection pipeline.
+Tests for SimpleGraspEnv, DummyVLA, DiffusionHead, and data collection pipeline.
 """
 
 import sys
@@ -60,10 +60,17 @@ class TestSimpleGraspEnv:
 
     def test_step_clips_actions(self, env):
         env.reset()
-        # Extreme action should be clipped
-        action = np.array([100.0, -100.0, 50.0, 1.0])
+        # Extreme action should be clipped — 7-DOF
+        action = np.array([100.0, -100.0, 50.0, 0.0, 0.0, 0.0, 1.0])
         obs, reward, done, info = env.step(action)
         # Should not crash
+        assert obs["image"].shape == (64, 64, 3)
+
+    def test_step_4dof_backward_compat(self, env):
+        """4-DOF actions should still work (backward compatibility)."""
+        env.reset()
+        action = np.array([0.1, 0.0, -0.1, -1.0])
+        obs, reward, done, info = env.step(action)
         assert obs["image"].shape == (64, 64, 3)
 
     def test_reset_randomization(self, env):
@@ -103,10 +110,10 @@ class TestDummyVLA:
 
     def test_predict_action_shape(self):
         from models.dummy_vla import DummyVLA
-        model = DummyVLA("flow_matching", action_dim=4)
+        model = DummyVLA("flow_matching", action_dim=7)
         image = np.random.randint(0, 255, (128, 128, 3), dtype=np.uint8)
         action, info = model.predict_action(image, "pick up the red cube")
-        assert action.shape == (4,)
+        assert action.shape == (7,)
         assert "decoder_type" in info
 
     def test_all_decoder_types(self):
@@ -115,7 +122,7 @@ class TestDummyVLA:
             model = DummyVLA(decoder)
             image = np.zeros((64, 64, 3), dtype=np.uint8)
             action, info = model.predict_action(image, "test")
-            assert action.shape == (4,)
+            assert action.shape == (7,)
             assert info["decoder_type"] == decoder
 
     def test_oracle_policy(self):
@@ -127,8 +134,36 @@ class TestDummyVLA:
             gripper_pos=np.array([0.5, 0.0, 0.5]),
             target_pos=np.array([0.4, 0.1, 0.24]),
         )
-        assert action.shape == (4,)
+        assert action.shape == (7,)
         assert np.all(np.abs(action) <= 1.0)
+
+
+class TestDiffusionHead:
+    """Tests for the DiffusionHead model."""
+
+    def test_forward_shape(self):
+        import torch
+        from models.diffusion_head import DiffusionHead
+        head = DiffusionHead(
+            feature_dim=512, action_dim=7, action_horizon=4,
+            hidden_dim=128, num_layers=2,
+        )
+        features = torch.randn(2, 512)
+        actions_gt = torch.randn(2, 4, 7)
+        loss, info = head(features, actions_gt)
+        assert loss.shape == ()
+        assert "diffusion_loss" in info
+
+    def test_sample_shape(self):
+        import torch
+        from models.diffusion_head import DiffusionHead
+        head = DiffusionHead(
+            feature_dim=512, action_dim=7, action_horizon=4,
+            hidden_dim=128, num_layers=2,
+        )
+        features = torch.randn(2, 512)
+        actions = head.sample(features, num_steps=5)
+        assert actions.shape == (2, 4, 7)
 
 
 class TestCollectDemos:
@@ -164,7 +199,7 @@ class TestCollectDemos:
         assert "actions" in demo
         assert "success" in demo
         assert demo["images"].ndim == 4  # (N, H, W, 3)
-        assert demo["actions"].ndim == 2  # (N, 4)
+        assert demo["actions"].ndim == 2  # (N, 7)
 
 
 if __name__ == "__main__":

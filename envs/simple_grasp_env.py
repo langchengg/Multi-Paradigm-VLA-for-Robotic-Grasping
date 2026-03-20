@@ -276,15 +276,23 @@ class SimpleGraspEnv:
         Execute action.
 
         Args:
-            action: (4,) array [dx, dy, dz, gripper_cmd]
+            action: (7,) array [dx, dy, dz, dax, day, daz, gripper_cmd]
+                   OR (4,) array [dx, dy, dz, gripper_cmd] for backward compat
                    dx/dy/dz in [-1, 1] scaled to position deltas
+                   dax/day/daz: ignored (3-DOF gripper has no rotation)
                    gripper_cmd > 0 → close, < 0 → open
 
         Returns:
             obs, reward, done, info
         """
+        action = np.asarray(action, dtype=np.float64)
         action = np.clip(action, -1.0, 1.0)
         self._step_count += 1
+
+        # Backward compatibility: 4-DOF → 7-DOF
+        if len(action) == 4:
+            action = np.array([action[0], action[1], action[2],
+                               0.0, 0.0, 0.0, action[3]])
 
         # Update gripper target position (incremental)
         scale = 0.02  # meters per unit action
@@ -297,8 +305,8 @@ class SimpleGraspEnv:
         self._gripper_target[1] = np.clip(self._gripper_target[1], -0.25, 0.25)
         self._gripper_target[2] = np.clip(self._gripper_target[2], -0.35, 0.15)
 
-        # Gripper open/close
-        if action[3] > 0:
+        # Gripper open/close (index 6 in 7-DOF)
+        if action[6] > 0:
             self._finger_target = -0.005  # close (fingers move inward)
         else:
             self._finger_target = 0.025  # open

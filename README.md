@@ -26,7 +26,7 @@ VLA models (Vision-Language-Action) take in camera images + language instruction
 | Expert Policy | Autoregressive | Diffusion | Flow-Matching |
 |:---:|:---:|:---:|:---:|
 | ![expert](assets/expert_demo.gif) | ![auto](assets/autoregressive/episode_000_green_cube.gif) | ![diff](assets/diffusion/episode_000_red_cube.gif) | ![flow](assets/flow_matching/episode_000_red_cube.gif) |
-| Scripted: 100% | Success: 100% | Success: 100% | **Success: 85%** |
+| Scripted: 100% | DummyVLA: 100% | DummyVLA: 100% | **DummyVLA: 100%** |
 
 ---
 
@@ -110,13 +110,15 @@ OpenVLA 生成动作也一样:
 
 | | Autoregressive (OpenVLA) | Diffusion | **Flow-Matching (π0)** |
 |---|:---:|:---:|:---:|
-| **方法** | Token-by-token 分类 | 迭代去噪 | ODE 直线积分 |
+| **方法** | Token-by-token 分类 | 迭代去噪 (DDPM/DDIM) | ODE 直线积分 |
 | **灵感来源** | OpenVLA | Diffusion Policy | π0 (Physical Intelligence) |
-| **成功率** | 72% | 78% | **85%** |
-| **平均步数** | 67 | 65 | **62** |
-| **推理延迟** | ~150ms | ~80ms | **~30ms** |
+| **成功率** ¹ | ~72% | ~78% | **~85%** |
+| **平均步数** ¹ | ~67 | ~65 | **~62** |
+| **推理延迟** ¹ | ~150ms | ~80ms | **~30ms** |
 | **动作精度** | 256 bins 离散 | 连续 (∞) | 连续 (∞) |
-| **Action Chunking** | ✗ 单步 | ✓ 可选 | ✓ H=4 |
+| **Action Chunking** | ✗ 单步 | ✓ H=4 | ✓ H=4 |
+
+> ¹ 期望数据：成功率和延迟为 Kaggle T4 上用真实 VLA 模型推理的预期值。本地 `scripts/run_demo.py` 使用 DummyVLA (oracle heuristic policy)，3 个 decoder 均为 100% 成功率。真实基准结果需在 Kaggle 上运行 Notebook 2+3 获得。
 
 **Key Finding**: Flow-matching 在速度和成功率上都优于其他方法：推理速度是自回归的 **5×**，并且连续空间输出避免了离散化误差。
 
@@ -183,7 +185,7 @@ You should see:
 python -m pytest tests/test_env.py -v
 ```
 
-Expected: `16 passed` ✅
+Expected: `20 passed` ✅
 
 ### Step 3: Run Full Local Pipeline (~15 seconds)
 
@@ -208,8 +210,20 @@ python models/flow_matching_head.py
 Expected:
 ```
 ✅ Flow loss: ~1.83
-✅ Predicted actions: torch.Size([4, 4, 4])   # (batch, horizon, action_dim)
+✅ Predicted actions: torch.Size([4, 4, 7])   # (batch, horizon, action_dim)
    FlowMatchingHead params: 0.40M
+```
+
+```bash
+# Standalone diffusion head test (new)
+python models/diffusion_head.py
+```
+
+Expected:
+```
+✅ Diffusion loss: ~1.00
+✅ Predicted actions: torch.Size([4, 4, 7])   # (batch, horizon, action_dim)
+   DiffusionHead params: ~0.40M
 ```
 
 ### Step 5: Train on Kaggle T4 GPU
@@ -245,6 +259,7 @@ ls assets/
 │   └── robosuite_wrapper.py        # Robosuite Lift/PickPlaceCan wrapper
 ├── models/
 │   ├── flow_matching_head.py       # 🔥 Flow-matching action decoder (π0-inspired)
+│   ├── diffusion_head.py           # 🔥 Diffusion action decoder (DDPM/DDIM)
 │   └── dummy_vla.py                # Dummy VLA implementing all 3 decoders for testing
 ├── data/
 │   └── collect_demos.py            # Scripted expert demo collection
@@ -261,7 +276,8 @@ ls assets/
 ├── scripts/
 │   └── run_demo.py                 # One-click: full pipeline in ~15 seconds
 ├── tests/
-│   └── test_env.py                 # Unit tests (16/16 passing)
+│   ├── test_env.py                 # Unit tests (20/20 passing)
+│   └── test_rendering.py           # Headless rendering tests
 └── requirements.txt
 ```
 
@@ -273,7 +289,9 @@ ls assets/
 
 - **7-DOF** Franka Emika Panda arm (based on MuJoCo Menagerie geometry)
 - **Parallel gripper** with 2 fingers and finger pads
-- **Jacobian-based IK**: Resolved-rate inverse kinematics (damped least-squares) converts Cartesian (dx, dy, dz) actions to 7-DOF joint commands
+- **7-DOF action space**: `[dx, dy, dz, dax, day, daz, gripper]` — Cartesian + orientation control
+- **Backward compatible**: also accepts 4-DOF `[dx, dy, dz, gripper]` (rotation auto-padded to 0)
+- **Jacobian-based IK**: Resolved-rate inverse kinematics (damped least-squares) converts Cartesian + angular velocity to 7-DOF joint commands using both position and rotation Jacobians
 - **3 colored objects** (red, blue, green cubes) with randomized positions
 - **12 language instructions** across 3 objects
 - **3 camera views** (front, top-down, side) at 256×256
@@ -298,6 +316,29 @@ Key choices:
 - **Action chunking** H=4 (predict 4 future actions at once)
 - **Sinusoidal time embeddings** (same as diffusion models)
 - **~0.4M parameters** for the flow head alone
+
+### Diffusion Decoder (Diffusion-Policy-inspired)
+
+```python
+# Training (DDPM)
+t = randint(0, T)                                   # Random timestep
+noise = randn_like(action)                           # Sample noise
+x_t = sqrt(ā_t) * action_gt + sqrt(1-ā_t) * noise   # Forward diffusion
+loss = MSE(noise_net(x_t, t, features), noise)       # Predict noise
+
+# Inference (DDIM, 10 steps — deterministic, no stochastic noise)
+x = randn(batch, horizon * action_dim)               # Start from noise
+for t in reversed(ddim_timesteps):                   # 10 evenly-spaced steps
+    pred_noise = noise_net(x, t, features)
+    pred_x0 = (x - sqrt(1-ā_t)*pred_noise) / sqrt(ā_t)
+    x = sqrt(ā_{t-1}) * pred_x0 + sqrt(1-ā_{t-1}) * pred_noise
+```
+
+Key choices:
+- **Cosine noise schedule** (improved DDPM, Nichol & Dhariwal 2021)
+- **DDIM deterministic sampling** for faster inference (10 steps vs 50-100)
+- **Action chunking** H=4 (same as flow-matching)
+- **~0.4M parameters** for the diffusion head
 
 ### OpenVLA QLoRA Setup (Notebook 2)
 
@@ -342,9 +383,11 @@ For each episode (50 episodes per decoder):
 ## 🔮 Future Directions
 
 - [x] ~~Implement flow-matching decoder (ODE-based)~~
+- [x] ~~Implement diffusion decoder (DDPM/DDIM)~~
 - [x] ~~Add action chunking (H=4 future actions)~~
 - [x] ~~OpenVLA QLoRA fine-tuning on T4~~
 - [x] ~~Franka Panda with parallel gripper~~
+- [x] ~~7-DOF action space (Cartesian + orientation + gripper)~~
 - [ ] Domain randomization (lighting, textures, camera poses)
 - [ ] Sim-to-real transfer analysis
 - [ ] Multi-object sequential manipulation

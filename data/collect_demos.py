@@ -26,7 +26,7 @@ def scripted_grasp_policy(obs, phase, phase_step, target_pos):
         target_pos: target object position
 
     Returns:
-        action: (4,) action [dx, dy, dz, gripper_cmd]
+        action: (7,) action [dx, dy, dz, dax, day, daz, gripper_cmd]
         new_phase: updated phase
         new_phase_step: updated step count
     """
@@ -37,9 +37,10 @@ def scripted_grasp_policy(obs, phase, phase_step, target_pos):
         goal = target_pos.copy()
         goal[2] += 0.15  # 15cm above
         direction = goal - gripper_pos
-        action = np.zeros(4)
+        action = np.zeros(7)
         action[:3] = direction * 5.0  # P-gain
-        action[3] = -1.0  # open gripper
+        action[3:6] = 0.0  # no rotation
+        action[6] = -1.0  # open gripper
 
         if np.linalg.norm(direction) < 0.02 or phase_step > 30:
             return action, 1, 0
@@ -50,9 +51,10 @@ def scripted_grasp_policy(obs, phase, phase_step, target_pos):
         goal = target_pos.copy()
         goal[2] += 0.02  # 2cm above (contact height)
         direction = goal - gripper_pos
-        action = np.zeros(4)
+        action = np.zeros(7)
         action[:3] = direction * 4.0
-        action[3] = -1.0  # open gripper
+        action[3:6] = 0.0  # no rotation
+        action[6] = -1.0  # open gripper
 
         if np.linalg.norm(direction) < 0.015 or phase_step > 25:
             return action, 2, 0
@@ -60,8 +62,8 @@ def scripted_grasp_policy(obs, phase, phase_step, target_pos):
 
     elif phase == 2:
         # Phase 2: Close gripper
-        action = np.zeros(4)
-        action[3] = 1.0  # close gripper
+        action = np.zeros(7)
+        action[6] = 1.0  # close gripper
 
         if phase_step > 10:
             return action, 3, 0
@@ -72,9 +74,10 @@ def scripted_grasp_policy(obs, phase, phase_step, target_pos):
         goal = gripper_pos.copy()
         goal[2] = 0.6  # lift target height
         direction = goal - gripper_pos
-        action = np.zeros(4)
+        action = np.zeros(7)
         action[:3] = direction * 3.0
-        action[3] = 1.0  # keep gripper closed
+        action[3:6] = 0.0  # no rotation
+        action[6] = 1.0  # keep gripper closed
 
         return action, 3, phase_step + 1
 

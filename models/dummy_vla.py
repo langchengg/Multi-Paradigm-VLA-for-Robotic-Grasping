@@ -34,7 +34,7 @@ class DummyVLA:
         "flow_matching": 0.03,  # ~30ms (fastest, few ODE steps)
     }
 
-    def __init__(self, decoder_type="flow_matching", action_dim=4, simulate_latency=False):
+    def __init__(self, decoder_type="flow_matching", action_dim=7, simulate_latency=False):
         """
         Args:
             decoder_type: "autoregressive", "diffusion", or "flow_matching"
@@ -81,7 +81,7 @@ class DummyVLA:
             target_pos: (3,) optional, target object position
 
         Returns:
-            action: (action_dim,) float array
+            action: (action_dim,) float array — default 7-DOF: [dx,dy,dz,dax,day,daz,gripper]
             info: dict with inference metadata
         """
         self._call_count += 1
@@ -129,7 +129,8 @@ class DummyVLA:
             goal[2] += 0.15
             direction = goal - gripper_pos
             action[:3] = direction * 5.0  # P-gain
-            action[3] = -1.0  # open gripper
+            action[3:6] = 0.0  # no rotation
+            action[6] = -1.0  # open gripper
             if np.linalg.norm(direction) < 0.02 or self._phase_step > 30:
                 self._phase = 1
                 self._phase_step = 0
@@ -140,14 +141,15 @@ class DummyVLA:
             goal[2] += 0.02
             direction = goal - gripper_pos
             action[:3] = direction * 4.0
-            action[3] = -1.0  # open
+            action[3:6] = 0.0  # no rotation
+            action[6] = -1.0  # open
             if np.linalg.norm(direction) < 0.015 or self._phase_step > 25:
                 self._phase = 2
                 self._phase_step = 0
 
         elif self._phase == 2:
             # Phase 2: Close gripper
-            action[3] = 1.0  # close
+            action[6] = 1.0  # close
             if self._phase_step > 10:
                 self._phase = 3
                 self._phase_step = 0
@@ -158,7 +160,8 @@ class DummyVLA:
             goal[2] = 0.6
             direction = goal - gripper_pos
             action[:3] = direction * 3.0
-            action[3] = 1.0  # keep closed
+            action[3:6] = 0.0  # no rotation
+            action[6] = 1.0  # keep closed
 
         # Add decoder-specific noise (less noise → better success)
         noise_scale = {
@@ -168,6 +171,7 @@ class DummyVLA:
         }[self.decoder_type]
 
         action[:3] += np.random.normal(0, noise_scale, 3)
+        action[3:6] += np.random.normal(0, noise_scale * 0.3, 3)  # less rotation noise
         return np.clip(action, -1.0, 1.0)
 
     def _random_policy(self, image, instruction):

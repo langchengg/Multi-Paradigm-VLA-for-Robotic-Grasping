@@ -184,7 +184,7 @@ class FlowMatchingHead(nn.Module):
 # Cell 4: Lightweight VLA Model
 # ═══════════════════════════════════════════════════════════════
 
-from transformers import ViTModel, AutoModel, AutoTokenizer
+from transformers import BertModel, BertTokenizer, ViTModel
 from torchvision import transforms
 
 
@@ -207,8 +207,8 @@ class FlowMatchingVLA(nn.Module):
                 param.requires_grad = True
 
         # Text encoder
-        self.text_model = AutoModel.from_pretrained("prajjwal1/bert-small")
-        self.tokenizer = AutoTokenizer.from_pretrained("prajjwal1/bert-small")
+        self.text_model = BertModel.from_pretrained("prajjwal1/bert-small")
+        self.tokenizer = BertTokenizer.from_pretrained("prajjwal1/bert-small")
         for param in self.text_model.parameters():
             param.requires_grad = False  # freeze
         for layer in self.text_model.encoder.layer[-1:]:

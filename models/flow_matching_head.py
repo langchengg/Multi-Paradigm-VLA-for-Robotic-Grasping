@@ -252,13 +252,14 @@ class FlowMatchingVLA(nn.Module):
         self.action_horizon = action_horizon
 
         # Vision encoder
-        from transformers import ViTModel, AutoModel, AutoTokenizer
+        from transformers import BertModel, BertTokenizer, ViTModel
         self.vision_encoder = ViTModel.from_pretrained(vision_model_name)
         vision_dim = self.vision_encoder.config.hidden_size  # 768
 
-        # Text encoder  
-        self.text_encoder = AutoModel.from_pretrained(text_model_name)
-        self.tokenizer = AutoTokenizer.from_pretrained(text_model_name)
+        # prajjwal1/bert-small is a BERT checkpoint but its config can fail AutoModel
+        # resolution on newer transformers, so load the concrete BERT classes directly.
+        self.text_encoder = BertModel.from_pretrained(text_model_name)
+        self.tokenizer = BertTokenizer.from_pretrained(text_model_name)
         text_dim = self.text_encoder.config.hidden_size  # 512
 
         # Fusion: project both modalities to shared space

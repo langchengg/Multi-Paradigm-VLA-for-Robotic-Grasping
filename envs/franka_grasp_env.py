@@ -36,10 +36,13 @@ class FrankaGraspEnv:
     """
     Franka Panda tabletop grasping environment.
 
-    Action space: (4,) float32
-        [dx, dy, dz, gripper] in [-1, 1]
-        dx/dy/dz: end-effector Cartesian velocity (scaled by 0.02m/step)
+    Action space: (7,) float32 (also accepts (4,) for backward compatibility)
+        [dx, dy, dz, dax, day, daz, gripper] in [-1, 1]
+        dx/dy/dz: end-effector Cartesian velocity (scaled by 0.015m/step)
+        dax/day/daz: end-effector angular velocity (scaled by 0.05rad/step)
         gripper: >0 close, <0 open
+
+        If (4,) action is provided: [dx, dy, dz, gripper] — rotation is set to 0.
 
     Observation:
         image: (H, W, 3) uint8 — camera RGB
@@ -328,33 +331,47 @@ class FrankaGraspEnv:
         return self.data.site_xpos[self._ee_site_id].copy()
 
     def _get_ee_jac(self):
-        """Get end-effector Jacobian (3×nv for position)."""
+        """Get end-effector Jacobian (3×nv for position, 3×nv for rotation)."""
         jacp = np.zeros((3, self.model.nv))
-        mujoco.mj_jacSite(self.model, self.data, jacp, None, self._ee_site_id)
+        jacr = np.zeros((3, self.model.nv))
+        mujoco.mj_jacSite(self.model, self.data, jacp, jacr, self._ee_site_id)
         # Extract columns for arm joints only
-        arm_jac = np.zeros((3, 7))
+        arm_jacp = np.zeros((3, 7))
+        arm_jacr = np.zeros((3, 7))
         for i, jid in enumerate(self._arm_joint_ids):
             dof_adr = self.model.jnt_dofadr[jid]
-            arm_jac[:, i] = jacp[:, dof_adr]
-        return arm_jac
+            arm_jacp[:, i] = jacp[:, dof_adr]
+            arm_jacr[:, i] = jacr[:, dof_adr]
+        return arm_jacp, arm_jacr
 
-    def _ik_step(self, dx_cart):
+    def _ik_step(self, dx_cart, dx_rot=None):
         """
-        Resolved-rate IK: convert Cartesian velocity to joint velocity.
+        Resolved-rate IK: convert Cartesian + angular velocity to joint velocity.
 
         Uses damped least-squares (DLS) for stability:
             dq = J^T (J J^T + λ²I)^{-1} dx
 
         Args:
             dx_cart: (3,) Cartesian displacement [dx, dy, dz]
+            dx_rot: (3,) angular displacement [dax, day, daz] or None
 
         Returns:
             dq: (7,) joint displacement
         """
-        J = self._get_ee_jac()  # (3, 7)
+        Jp, Jr = self._get_ee_jac()  # (3, 7) each
         lam = 0.05  # damping factor
-        JJT = J @ J.T + lam**2 * np.eye(3)
-        dq = J.T @ np.linalg.solve(JJT, dx_cart)
+
+        if dx_rot is not None and np.linalg.norm(dx_rot) > 1e-8:
+            # Stack position + rotation Jacobians
+            J = np.vstack([Jp, Jr])  # (6, 7)
+            dx = np.concatenate([dx_cart, dx_rot])  # (6,)
+            JJT = J @ J.T + lam**2 * np.eye(6)
+        else:
+            J = Jp  # (3, 7)
+            dx = dx_cart
+            JJT = J @ J.T + lam**2 * np.eye(3)
+
+        dq = J.T @ np.linalg.solve(JJT, dx)
         return dq
 
     def reset(self, target_object=None, randomize=True):
@@ -398,17 +415,25 @@ class FrankaGraspEnv:
         Execute action.
 
         Args:
-            action: (4,) [dx, dy, dz, gripper] in [-1, 1]
+            action: (7,) [dx, dy, dz, dax, day, daz, gripper] in [-1, 1]
+                    OR (4,) [dx, dy, dz, gripper] for backward compatibility
 
         Returns:
             obs, reward, done, info
         """
+        action = np.asarray(action, dtype=np.float64)
         action = np.clip(action, -1.0, 1.0)
         self._step_count += 1
 
-        # Convert Cartesian delta to joint delta via IK
-        cart_delta = action[:3] * 0.015  # scale to meters
-        dq = self._ik_step(cart_delta)
+        # Backward compatibility: 4-DOF → 7-DOF
+        if len(action) == 4:
+            action = np.array([action[0], action[1], action[2],
+                               0.0, 0.0, 0.0, action[3]])
+
+        # Convert Cartesian + rotation delta to joint delta via IK
+        cart_delta = action[:3] * 0.015   # scale to meters
+        rot_delta = action[3:6] * 0.05    # scale to radians
+        dq = self._ik_step(cart_delta, rot_delta)
 
         # Update joint position targets
         for i in range(7):
@@ -421,7 +446,7 @@ class FrankaGraspEnv:
             self.data.ctrl[self._act_ids[f"act_j{i+1}"]] = target_q
 
         # Gripper
-        self._finger_target = 0.001 if action[3] > 0 else 0.04
+        self._finger_target = 0.001 if action[6] > 0 else 0.04
         self.data.ctrl[self._act_ids["act_finger_l"]] = self._finger_target
         self.data.ctrl[self._act_ids["act_finger_r"]] = self._finger_target
 
@@ -494,11 +519,15 @@ if __name__ == "__main__":
         Image.fromarray(frame).save(f"/tmp/franka_{cam}.png")
         print(f"  Saved /tmp/franka_{cam}.png")
 
-    # Test a few steps
+    # Test a few steps with 7-DOF action
     for i in range(5):
-        action = np.array([0.1, 0.0, -0.3, -1.0])  # move forward+down, open
+        action = np.array([0.1, 0.0, -0.3, 0.0, 0.0, 0.0, -1.0])  # move forward+down, no rotation, open
         obs, r, done, info = env.step(action)
         print(f"  Step {i}: ee={obs['gripper_pos']}, r={r:.2f}, dist={info['distance']:.3f}")
+
+    # Test backward-compatible 4-DOF action
+    obs, r, done, info = env.step(np.array([0.1, 0.0, -0.3, -1.0]))
+    print(f"  4-DOF compat: ee={obs['gripper_pos']}, r={r:.2f}")
 
     env.close()
     print("\n✅ Franka Panda env test passed!")

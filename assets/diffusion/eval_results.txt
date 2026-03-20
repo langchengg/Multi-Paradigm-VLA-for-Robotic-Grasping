@@ -1,3 +1,9 @@
+# Source: DummyVLA (oracle heuristic policy)
+# NOTE: These results are from the DummyVLA testing model, NOT from a
+# trained OpenVLA model. DummyVLA uses a scripted policy with access to
+# ground-truth object positions and simulated decoder-specific noise.
+# For real VLA benchmark results, run Notebooks 2+3 on Kaggle T4 GPU.
+
 VLA MuJoCo Closed-Loop Evaluation Results
 ==================================================
 success_rate: 1.0000
