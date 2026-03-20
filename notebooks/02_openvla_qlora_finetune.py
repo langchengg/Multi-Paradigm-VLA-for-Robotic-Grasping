@@ -26,7 +26,9 @@ import subprocess, sys
 
 def install():
     pkgs = [
-        "transformers>=4.40.0",
+        "transformers==4.40.1",
+        "tokenizers==0.19.1",
+        "timm==0.9.10",
         "accelerate>=0.27.0",
         "peft>=0.10.0",
         "bitsandbytes>=0.43.0",
@@ -36,7 +38,7 @@ def install():
         "wandb",
         "datasets", # For HuggingFace LIBERO datasets
     ]
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + pkgs)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
     print("✅ Dependencies installed")
 
 install()
@@ -111,12 +113,12 @@ class VLADemoDataset(Dataset):
 
                 images = data["images"]
                 actions = data["actions"]
-                instruction = str(data["instruction"])
+                instructions = data["instructions"]
 
                 for t in range(len(actions)):
                     self.samples.append({
                         "image": images[t],               # (H, W, 3) uint8
-                        "instruction": instruction,       # str
+                        "instruction": str(instructions[t]),  # str
                         "action_4d": actions[t],          # (4,) float
                         "source": "mujoco",
                     })
@@ -182,7 +184,11 @@ else:
 # Cell 4: Load OpenVLA with QLoRA (4-bit quantization)
 # ═══════════════════════════════════════════════════════════════
 
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoProcessor, BitsAndBytesConfig
+try:
+    from transformers import AutoModelForVision2Seq as OpenVLAModelClass
+except ImportError:
+    from transformers import AutoModelForImageTextToText as OpenVLAModelClass
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 print("Loading OpenVLA-7B with 4-bit quantization...")
@@ -196,7 +202,7 @@ bnb_config = BitsAndBytesConfig(
 )
 
 # Load model
-model = AutoModelForVision2Seq.from_pretrained(
+model = OpenVLAModelClass.from_pretrained(
     MODEL_NAME,
     quantization_config=bnb_config,
     torch_dtype=torch.float16,
