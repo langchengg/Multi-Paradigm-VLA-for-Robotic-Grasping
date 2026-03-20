@@ -83,17 +83,17 @@ class FrankaGraspEnv:
         <geom type="plane" size="2 2 0.01" material="grid"/>
 
         <!-- Table -->
-        <body name="table" pos="0.5 0 0.2">
-          <geom type="box" size="0.35 0.4 0.025" material="table_wood" mass="20"
+        <body name="table" pos="0.25 0 0.2">
+          <geom type="box" size="0.45 0.4 0.025" material="table_wood" mass="20"
                 contype="1" conaffinity="1"/>
-          <!-- Legs -->
-          <geom type="cylinder" size="0.025 0.1" pos="-0.30 -0.35 -0.125"
+          <!-- Legs (from table bottom to ground) -->
+          <geom type="cylinder" size="0.025 0.1" pos="-0.40 -0.35 -0.1"
                 rgba="0.45 0.35 0.28 1" contype="0" conaffinity="0"/>
-          <geom type="cylinder" size="0.025 0.1" pos="0.30 -0.35 -0.125"
+          <geom type="cylinder" size="0.025 0.1" pos="0.40 -0.35 -0.1"
                 rgba="0.45 0.35 0.28 1" contype="0" conaffinity="0"/>
-          <geom type="cylinder" size="0.025 0.1" pos="-0.30 0.35 -0.125"
+          <geom type="cylinder" size="0.025 0.1" pos="-0.40 0.35 -0.1"
                 rgba="0.45 0.35 0.28 1" contype="0" conaffinity="0"/>
-          <geom type="cylinder" size="0.025 0.1" pos="0.30 0.35 -0.125"
+          <geom type="cylinder" size="0.025 0.1" pos="0.40 0.35 -0.1"
                 rgba="0.45 0.35 0.28 1" contype="0" conaffinity="0"/>
         </body>
 
