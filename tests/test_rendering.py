@@ -11,68 +11,112 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from envs._rendering import configure_headless_rendering, create_renderer
 
 
-def test_configure_headless_rendering_defaults_to_osmesa_on_headless_linux():
+def test_configure_headless_rendering_accepts_explicit_backend(monkeypatch):
+    environ = {"MUJOCO_GL": "egl"}
+    calls = []
+
+    monkeypatch.setattr(
+        "envs._rendering._ensure_backend_works",
+        lambda backend, _environ, _python: calls.append(backend),
+    )
+
+    backend = configure_headless_rendering(
+        environ=environ,
+        platform="linux",
+        python_executable="python",
+    )
+
+    assert backend == "egl"
+    assert environ["PYOPENGL_PLATFORM"] == "egl"
+    assert calls == ["egl"]
+
+
+def test_configure_headless_rendering_uses_requested_pyopengl_platform(monkeypatch):
+    environ = {"PYOPENGL_PLATFORM": "osmesa"}
+    calls = []
+
+    monkeypatch.setattr(
+        "envs._rendering._ensure_backend_works",
+        lambda backend, _environ, _python: calls.append(backend),
+    )
+
+    backend = configure_headless_rendering(
+        environ=environ,
+        platform="linux",
+        python_executable="python",
+    )
+
+    assert backend == "osmesa"
+    assert environ["MUJOCO_GL"] == "osmesa"
+    assert calls == ["osmesa"]
+
+
+def test_configure_headless_rendering_auto_falls_back_to_osmesa(monkeypatch):
     environ = {}
 
-    backend = configure_headless_rendering(environ=environ, platform="linux")
+    monkeypatch.setattr("envs._rendering._AUTO_BACKEND", None)
+
+    def fake_probe(backend, _environ, _python):
+        if backend == "egl":
+            return False, "egl failed"
+        return True, "ok"
+
+    monkeypatch.setattr("envs._rendering._probe_backend", fake_probe)
+
+    backend = configure_headless_rendering(
+        environ=environ,
+        platform="linux",
+        python_executable="python",
+    )
 
     assert backend == "osmesa"
     assert environ["MUJOCO_GL"] == "osmesa"
     assert environ["PYOPENGL_PLATFORM"] == "osmesa"
 
 
-def test_configure_headless_rendering_preserves_explicit_backend():
-    environ = {"MUJOCO_GL": "egl"}
+def test_configure_headless_rendering_rejects_invalid_headless_backend():
+    with pytest.raises(RuntimeError, match="MUJOCO_GL=egl or MUJOCO_GL=osmesa"):
+        configure_headless_rendering(
+            environ={"MUJOCO_GL": "glfw"},
+            platform="linux",
+            python_executable="python",
+        )
 
-    backend = configure_headless_rendering(environ=environ, platform="linux")
 
-    assert backend == "egl"
-    assert environ["MUJOCO_GL"] == "egl"
-    assert "PYOPENGL_PLATFORM" not in environ
-
-
-def test_configure_headless_rendering_skips_non_linux_or_display():
-    linux_with_display = {"DISPLAY": ":0"}
-    macos = {}
-
-    linux_backend = configure_headless_rendering(
-        environ=linux_with_display, platform="linux"
+def test_configure_headless_rendering_reports_broken_explicit_backend(monkeypatch):
+    monkeypatch.setattr(
+        "envs._rendering._probe_backend",
+        lambda backend, _environ, _python: (False, f"{backend} broke"),
     )
-    macos_backend = configure_headless_rendering(environ=macos, platform="darwin")
 
-    assert linux_backend is None
-    assert "MUJOCO_GL" not in linux_with_display
-    assert macos_backend is None
-    assert "MUJOCO_GL" not in macos
+    with pytest.raises(RuntimeError, match="Configured headless MuJoCo backend 'osmesa'"):
+        configure_headless_rendering(
+            environ={"MUJOCO_GL": "osmesa"},
+            platform="linux",
+            python_executable="python",
+        )
 
 
-def test_create_renderer_rejects_glfw_on_headless_linux():
+def test_create_renderer_wraps_backend_errors(monkeypatch):
     class DummyMujoco:
         class Renderer:
             def __init__(self, *_args, **_kwargs):
-                raise AssertionError("Renderer should not be constructed")
+                raise RuntimeError("egl init failed")
 
-    with pytest.raises(RuntimeError, match="MUJOCO_GL=osmesa or MUJOCO_GL=egl"):
+    monkeypatch.setattr(
+        "envs._rendering.configure_headless_rendering",
+        lambda **_kwargs: "egl",
+    )
+
+    with pytest.raises(RuntimeError, match="MUJOCO_GL='egl'"):
         create_renderer(
             DummyMujoco,
             object(),
             64,
             64,
-            environ={"MUJOCO_GL": "glfw"},
+            environ={},
             platform="linux",
         )
-
-
-def test_create_renderer_reports_missing_osmesa_libs(monkeypatch):
-    class DummyMujoco:
-        class Renderer:
-            def __init__(self, *_args, **_kwargs):
-                raise AssertionError("Renderer should not be constructed")
-
-    monkeypatch.setattr("envs._rendering._missing_osmesa_libraries", lambda: ["OSMesa"])
-
-    with pytest.raises(RuntimeError, match="libosmesa6-dev"):
-        create_renderer(DummyMujoco, object(), 64, 64, environ={}, platform="linux")
 
 
 def test_franka_env_smoke_with_fake_renderer(monkeypatch):
@@ -82,17 +126,15 @@ def test_franka_env_smoke_with_fake_renderer(monkeypatch):
         def __init__(self, _mujoco, _model, height, width):
             self.height = height
             self.width = width
-            self.last_camera = None
-            self.closed = False
 
         def update_scene(self, _data, camera=None):
-            self.last_camera = camera
+            self.camera = camera
 
         def render(self):
             return np.zeros((self.height, self.width, 3), dtype=np.uint8)
 
         def close(self):
-            self.closed = True
+            pass
 
     def fake_create_renderer(mujoco, model, *, height, width):
         return FakeRenderer(mujoco, model, height, width)
@@ -131,6 +173,21 @@ def test_envs_package_runs_shared_rendering_config(monkeypatch):
     assert calls
 
 
+def test_envs_package_is_lazy(monkeypatch):
+    monkeypatch.setenv("DISPLAY", ":0")
+    for name in list(sys.modules):
+        if name == "envs" or name.startswith("envs."):
+            sys.modules.pop(name)
+
+    envs = importlib.import_module("envs")
+
+    assert "envs.simple_grasp_env" not in sys.modules
+    assert "envs.franka_grasp_env" not in sys.modules
+
+    _ = envs.SimpleGraspEnv
+    assert "envs.simple_grasp_env" in sys.modules
+
+
 def test_flow_matching_notebook_uses_shared_env_module():
     notebook_path = (
         Path(__file__).resolve().parents[1] / "notebooks" / "03_flow_matching_eval.py"
@@ -139,6 +196,18 @@ def test_flow_matching_notebook_uses_shared_env_module():
 
     assert "notebooks.simplified_env" not in source
     assert "from envs.simple_grasp_env import SimpleGraspEnv" in source
+    assert "configure_headless_rendering()" in source
+    assert 'os.environ["MUJOCO_GL"] = "osmesa"' not in source
+
+
+def test_env_setup_notebook_uses_shared_rendering_helper():
+    notebook_path = (
+        Path(__file__).resolve().parents[1] / "notebooks" / "01_env_setup_and_demo.py"
+    )
+    source = notebook_path.read_text()
+
+    assert "configure_headless_rendering()" in source
+    assert 'os.environ["MUJOCO_GL"] = "osmesa"' not in source
 
 
 def test_readme_uses_module_entrypoint_for_franka_smoke_test():

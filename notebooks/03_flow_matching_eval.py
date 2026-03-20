@@ -31,19 +31,24 @@ def install():
             "Pillow>=9.0.0", "numpy>=1.24.0", "matplotlib>=3.7.0",
             "imageio>=2.30.0", "torchvision>=0.15.0"]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + pkgs)
-    subprocess.run("apt-get update -qq && apt-get install -y -qq libosmesa6-dev libglew-dev patchelf",
+    subprocess.run(
+                   "apt-get update -qq && apt-get install -y -qq "
+                   "libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev "
+                   "libosmesa6-dev libglew-dev patchelf",
                    shell=True, capture_output=True)
     print("✅ Dependencies installed")
 
 install()
 
 import os
-os.environ["MUJOCO_GL"] = "osmesa"
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from envs._rendering import configure_headless_rendering
+
+backend = configure_headless_rendering()
 
 import math
 import time
@@ -58,6 +63,7 @@ import matplotlib.pyplot as plt
 import mujoco
 
 print(f"✅ Loaded: MuJoCo {mujoco.__version__}, PyTorch {torch.__version__}")
+print(f"   Rendering backend: {backend or os.environ.get('MUJOCO_GL', 'default')}")
 print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

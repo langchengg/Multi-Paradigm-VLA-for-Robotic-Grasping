@@ -158,7 +158,8 @@ Headless Linux / Kaggle also needs native off-screen rendering libraries:
 
 ```bash
 apt-get update -qq && apt-get install -y -qq \
-  libgl1-mesa-glx libgl1-mesa-dev libosmesa6-dev libglew-dev patchelf
+  libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev \
+  libosmesa6-dev libglew-dev patchelf
 ```
 
 ### Step 1: Verify Environment (10 seconds)

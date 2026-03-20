@@ -23,6 +23,7 @@ Output: data/demos/*.npz (upload as Kaggle Dataset)
 
 import subprocess
 import sys
+from pathlib import Path
 
 def install_packages():
     """Install MuJoCo and dependencies for Kaggle."""
@@ -36,10 +37,11 @@ def install_packages():
     for pkg in packages:
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-    # Install osmesa for headless rendering on Linux (Kaggle)
+    # Install native OpenGL backends for headless rendering on Linux (Kaggle)
     subprocess.run(
         "apt-get update -qq && apt-get install -y -qq "
-        "libgl1-mesa-glx libgl1-mesa-dev libosmesa6-dev libglew-dev patchelf",
+        "libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev "
+        "libosmesa6-dev libglew-dev patchelf",
         shell=True, capture_output=True
     )
     print("✅ Packages installed")
@@ -52,16 +54,20 @@ install_packages()
 
 import os
 
-# CRITICAL for Kaggle: Use osmesa (software rendering)
-os.environ["MUJOCO_GL"] = "osmesa"
-os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+PROJECT_ROOT = Path.cwd()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from envs._rendering import configure_headless_rendering
+
+backend = configure_headless_rendering()
 
 import mujoco
 import numpy as np
 from PIL import Image
 
 print(f"✅ MuJoCo {mujoco.__version__} loaded")
-print(f"   Rendering backend: {os.environ.get('MUJOCO_GL', 'default')}")
+print(f"   Rendering backend: {backend or os.environ.get('MUJOCO_GL', 'default')}")
 
 # ═══════════════════════════════════════════════════════════════
 # Cell 3: Define Custom Grasping Environment
