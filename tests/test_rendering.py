@@ -195,7 +195,8 @@ def test_flow_matching_notebook_uses_shared_env_module():
     source = notebook_path.read_text()
 
     assert "notebooks.simplified_env" not in source
-    assert "from envs.simple_grasp_env import SimpleGraspEnv" in source
+    assert "from envs.franka_grasp_env import FrankaGraspEnv" in source
+    assert "VLAMuJoCoEvaluator" in source
     assert "configure_headless_rendering()" in source
     assert 'os.environ["MUJOCO_GL"] = "osmesa"' not in source
 

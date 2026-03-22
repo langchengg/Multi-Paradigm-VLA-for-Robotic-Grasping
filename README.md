@@ -185,10 +185,17 @@ flow_matching:  success=..., latency=...ms
 3. `openvla-finetuned/final/`
 4. `openvla-finetuned/final/franka_action_config.json`
 5. `results/flow_matching_vla.pt`
-6. `results/training_curve.png`
-7. `results/flow_matching_ep0.gif` 到 `results/flow_matching_ep4.gif`
-8. `results/flow_trajectories_3d.png`
-9. `results/technical_report.md`
+6. `results/diffusion_vla.pt`
+7. `results/training_curve.png`
+8. `results/diffusion_training_curve.png`
+9. `results/autoregressive/episode_*.gif`
+10. `results/diffusion/episode_*.gif`
+11. `results/flow_matching/episode_*.gif`
+12. `results/comparison_summary.json`
+13. `results/comparison_table.md`
+14. `results/comparison_metrics.png`
+15. `results/decoder_trajectories_3d.png`
+16. `results/technical_report.md`
 
 ---
 

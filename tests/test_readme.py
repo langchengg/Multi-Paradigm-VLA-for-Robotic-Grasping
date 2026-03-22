@@ -15,6 +15,10 @@ def test_readme_prioritizes_run_order_and_real_outputs():
     assert "## 📦 Outputs After Running" in source
     assert "assets_quick.zip" in source
     assert "franka_action_config.json" in source
+    assert "results/autoregressive/episode_*.gif" in source
+    assert "results/diffusion/episode_*.gif" in source
+    assert "results/flow_matching/episode_*.gif" in source
+    assert "results/comparison_summary.json" in source
     assert "results/technical_report.md" in source
 
 

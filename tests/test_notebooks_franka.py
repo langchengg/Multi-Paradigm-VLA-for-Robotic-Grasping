@@ -35,3 +35,12 @@ def test_notebook3_uses_franka_env_and_true_7d_sampling():
     assert "x.reshape(B, self.horizon, self.action_dim)" in source
     assert 'instructions = data["instructions"]' in source
     assert 'data["instruction"]' not in source
+    assert "class DiffusionVLA(nn.Module):" in source
+    assert "class OpenVLAPolicyWrapper:" in source
+    assert "VLAMuJoCoEvaluator" in source
+    assert 'comparison["autoregressive"] = evaluate_policy("autoregressive", openvla_policy, env)' in source
+    assert 'comparison["diffusion"] = evaluate_policy("diffusion", diffusion_policy, env)' in source
+    assert 'comparison["flow_matching"] = evaluate_policy("flow_matching", flow_policy, env)' in source
+    assert 'print(f"   🎬 autoregressive/episode_*.gif")' in source
+    assert 'print(f"   🎬 diffusion/episode_*.gif")' in source
+    assert 'print(f"   🎬 flow_matching/episode_*.gif")' in source
