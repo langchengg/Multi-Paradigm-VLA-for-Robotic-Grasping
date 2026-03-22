@@ -28,6 +28,7 @@ else:
 configure_headless_rendering()
 
 import mujoco
+import mujoco.viewer
 import numpy as np
 from PIL import Image
 
@@ -322,6 +323,9 @@ class FrankaGraspEnv:
         self._max_steps = 150
         self._finger_target = 0.04  # open
 
+        # Interactive viewer (opt-in via launch_viewer())
+        self._viewer = None
+
         print(f"[FrankaGraspEnv] image={image_size}x{image_size}, camera={camera_name}")
         print(f"  7-DOF Franka Panda + parallel gripper")
         print(f"  Objects: {self.OBJECTS}")
@@ -361,8 +365,10 @@ class FrankaGraspEnv:
         Jp, Jr = self._get_ee_jac()  # (3, 7) each
         lam = 0.05  # damping factor
 
-        if dx_rot is not None and np.linalg.norm(dx_rot) > 1e-8:
-            # Stack position + rotation Jacobians
+        if dx_rot is not None:
+            # A zero angular command should still constrain angular velocity to 0.
+            # Otherwise the redundant arm can freely reorient while chasing xyz targets,
+            # which causes the end-effector to drift away from the tabletop workspace.
             J = np.vstack([Jp, Jr])  # (6, 7)
             dx = np.concatenate([dx_cart, dx_rot])  # (6,)
             JJT = J @ J.T + lam**2 * np.eye(6)
@@ -404,6 +410,7 @@ class FrankaGraspEnv:
         # Settle the simulation
         for _ in range(200):
             mujoco.mj_step(self.model, self.data)
+        self.sync_viewer()
 
         # Select target
         self.target = target_object or np.random.choice(self.OBJECTS)
@@ -453,6 +460,7 @@ class FrankaGraspEnv:
         # Simulate
         for _ in range(20):
             mujoco.mj_step(self.model, self.data)
+        self.sync_viewer()
 
         # Observations and reward
         obs = self._get_obs()
@@ -497,7 +505,34 @@ class FrankaGraspEnv:
                      duration=int(1000/fps), loop=0)
         print(f"Saved GIF: {save_path} ({len(frames)} frames, {fps} fps)")
 
+    def launch_viewer(self):
+        """Open an interactive MuJoCo viewer window (non-blocking).
+
+        Call this once before running episodes to visualise the arm in
+        real-time.  The viewer syncs automatically on every ``step()``
+        and ``reset()``.
+        """
+        if self._viewer is not None:
+            return  # already open
+        try:
+            self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            print("[FrankaGraspEnv] Interactive MuJoCo viewer launched")
+        except Exception as exc:
+            print(f"[FrankaGraspEnv] Could not launch viewer: {exc}")
+            self._viewer = None
+
+    def sync_viewer(self):
+        """Push latest physics state to the interactive viewer."""
+        if self._viewer is not None and self._viewer.is_running():
+            self._viewer.sync()
+
     def close(self):
+        if self._viewer is not None:
+            try:
+                self._viewer.close()
+            except Exception:
+                pass
+            self._viewer = None
         self.renderer.close()
 
 

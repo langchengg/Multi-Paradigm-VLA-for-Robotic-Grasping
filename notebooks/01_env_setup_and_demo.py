@@ -69,6 +69,9 @@ from PIL import Image
 print(f"✅ MuJoCo {mujoco.__version__} loaded")
 print(f"   Rendering backend: {backend or os.environ.get('MUJOCO_GL', 'default')}")
 
+# Interactive viewer: set ENABLE_VIEWER=1 to open a 3D window (macOS/desktop only)
+ENABLE_VIEWER = os.environ.get("ENABLE_VIEWER", "").strip() == "1"
+
 # ═══════════════════════════════════════════════════════════════
 # Cell 3: Load Shared Franka Panda Environment
 # ═══════════════════════════════════════════════════════════════
@@ -80,6 +83,9 @@ print("✅ FrankaGraspEnv ready")
 
 # Test environment
 env = FrankaGraspEnv(image_size=256, camera_name="frontview")
+if ENABLE_VIEWER:
+    env.launch_viewer()
+    print("   Viewer enabled. A 3D window should open if on macOS/desktop.")
 obs = env.reset(target_object="red_cube")
 print(f"   Image: {obs['image'].shape}, Instruction: '{obs['instruction']}'")
 print("   Action format: 7-DOF [dx, dy, dz, dax, day, daz, gripper]")
@@ -95,6 +101,8 @@ SAVE_DIR = "/kaggle/working/demos"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 env = FrankaGraspEnv(image_size=IMAGE_SIZE, camera_name="frontview")
+if ENABLE_VIEWER:
+    env.launch_viewer()
 demos, stats = collect_demos(
     env,
     num_demos=NUM_DEMOS,

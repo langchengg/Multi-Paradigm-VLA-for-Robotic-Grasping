@@ -45,7 +45,8 @@ class VLAMuJoCoEvaluator:
         self.use_oracle_info = use_oracle_info
 
     def evaluate(self, num_episodes=50, max_steps=150, record_video=True,
-                 save_dir="assets", target_objects=None, verbose=True):
+                 save_dir="assets", target_objects=None, verbose=True,
+                 visualize=False):
         """
         Run closed-loop evaluation.
 
@@ -61,6 +62,10 @@ class VLAMuJoCoEvaluator:
             results: dict with metrics and per-episode data
         """
         os.makedirs(save_dir, exist_ok=True)
+
+        # Launch interactive viewer if requested
+        if visualize and hasattr(self.env, "launch_viewer"):
+            self.env.launch_viewer()
 
         if target_objects is None:
             target_objects = getattr(self.env, "OBJECTS", ["red_cube", "blue_cube"])
@@ -156,13 +161,15 @@ class VLAMuJoCoEvaluator:
 
         return results
 
-    def evaluate_comparison(self, models_dict, num_episodes=30, **kwargs):
+    def evaluate_comparison(self, models_dict, num_episodes=30, visualize=False,
+                             **kwargs):
         """
         Compare multiple VLA models/decoders.
 
         Args:
             models_dict: {"name": model_instance, ...}
             num_episodes: episodes per model
+            visualize: if True, open interactive MuJoCo viewer
 
         Returns:
             comparison: dict of results per model
@@ -181,6 +188,7 @@ class VLAMuJoCoEvaluator:
             results = self.evaluate(
                 num_episodes=num_episodes,
                 save_dir=save_dir,
+                visualize=visualize,
                 **{k: v for k, v in kwargs.items() if k != "save_dir"},
             )
             comparison[name] = results

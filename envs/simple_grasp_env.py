@@ -21,6 +21,7 @@ else:
 configure_headless_rendering()
 
 import mujoco
+import mujoco.viewer
 import numpy as np
 from PIL import Image
 
@@ -219,6 +220,9 @@ class SimpleGraspEnv:
         self._gripper_target = np.array([0.0, 0.0, 0.0])
         self._finger_target = 0.025  # open
 
+        # Interactive viewer (opt-in via launch_viewer())
+        self._viewer = None
+
         print(f"[SimpleGraspEnv] image={image_size}x{image_size}, camera={camera_name}")
         print(f"  Objects: {self.OBJECTS}")
 
@@ -261,6 +265,7 @@ class SimpleGraspEnv:
         # Step to stabilize
         for _ in range(100):
             mujoco.mj_step(self.model, self.data)
+        self.sync_viewer()
 
         # Select target and instruction
         if target_object is None:
@@ -321,6 +326,7 @@ class SimpleGraspEnv:
         # Simulate forward
         for _ in range(20):  # 20 substeps × 0.002s = 0.04s per step → 25 Hz
             mujoco.mj_step(self.model, self.data)
+        self.sync_viewer()
 
         obs = self._get_obs()
 
@@ -391,8 +397,30 @@ class SimpleGraspEnv:
         )
         print(f"Saved GIF: {filename} ({len(frames)} frames, {fps} fps)")
 
+    def launch_viewer(self):
+        """Open an interactive MuJoCo viewer window (non-blocking)."""
+        if self._viewer is not None:
+            return
+        try:
+            self._viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            print("[SimpleGraspEnv] Interactive MuJoCo viewer launched")
+        except Exception as exc:
+            print(f"[SimpleGraspEnv] Could not launch viewer: {exc}")
+            self._viewer = None
+
+    def sync_viewer(self):
+        """Push latest physics state to the interactive viewer."""
+        if self._viewer is not None and self._viewer.is_running():
+            self._viewer.sync()
+
     def close(self):
-        """Clean up renderer."""
+        """Clean up renderer and viewer."""
+        if self._viewer is not None:
+            try:
+                self._viewer.close()
+            except Exception:
+                pass
+            self._viewer = None
         self.renderer.close()
 
 

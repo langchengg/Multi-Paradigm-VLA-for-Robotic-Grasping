@@ -83,6 +83,9 @@ print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Interactive viewer: set ENABLE_VIEWER=1 to open a 3D window (macOS/desktop only)
+ENABLE_VIEWER = os.environ.get("ENABLE_VIEWER", "").strip() == "1"
+
 # ═══════════════════════════════════════════════════════════════
 # Cell 2: Configuration
 # ═══════════════════════════════════════════════════════════════
@@ -807,6 +810,7 @@ def evaluate_policy(name, policy, env):
         record_video=True,
         save_dir=save_dir,
         verbose=True,
+        visualize=ENABLE_VIEWER,
     )
 
 

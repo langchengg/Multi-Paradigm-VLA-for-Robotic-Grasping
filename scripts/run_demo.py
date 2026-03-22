@@ -43,7 +43,7 @@ def package_assets_dir(assets_dir, archive_path):
     return archive_path
 
 
-def main(quick=False, use_simple=False):
+def main(quick=False, use_simple=False, use_viewer=False):
     total_start = time.time()
 
     # ─── Config ───
@@ -80,6 +80,10 @@ def main(quick=False, use_simple=False):
     else:
         from envs.franka_grasp_env import FrankaGraspEnv
         env = FrankaGraspEnv(image_size=image_size, camera_name="frontview")
+
+    if use_viewer:
+        env.launch_viewer()
+
     obs = env.reset(target_object="red_cube")
 
     print(f"  ✓ Image: {obs['image'].shape}, dtype={obs['image'].dtype}")
@@ -156,6 +160,7 @@ def main(quick=False, use_simple=False):
         max_steps=100,
         record_video=True,
         save_dir=str(assets_dir),
+        visualize=use_viewer,
     )
 
     # ═══════════════════════════════════════════════════════════════
@@ -263,6 +268,8 @@ if __name__ == "__main__":
                         help="Run quick test with fewer episodes (~15 seconds)")
     parser.add_argument("--simple", action="store_true",
                         help="Use simple 3-DOF env instead of Franka Panda")
+    parser.add_argument("--viewer", action="store_true",
+                        help="Open interactive MuJoCo viewer window (macOS/desktop)")
     args = parser.parse_args()
 
-    main(quick=args.quick, use_simple=args.simple)
+    main(quick=args.quick, use_simple=args.simple, use_viewer=args.viewer)
