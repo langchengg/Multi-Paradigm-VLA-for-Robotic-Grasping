@@ -27,7 +27,8 @@ def test_openvla_notebook_loads_real_data_instead_of_simulating_libero():
     source = notebook_path.read_text()
 
     assert 'LIBERO_DATASET_REPO = "physical-intelligence/libero"' in source
-    assert "LIBERO_MAX_SAMPLES = 5000" in source
+    assert "LIBERO_MAX_SAMPLES = 1000" in source
+    assert "NUM_EPOCHS = 1" in source
     assert "def resolve_demo_dir(preferred_dir):" in source
     assert 'load_dataset(' in source
     assert 'streaming=True' in source

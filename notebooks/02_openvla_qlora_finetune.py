@@ -85,7 +85,7 @@ USE_LIBERO = True                               # Mix in real LIBERO samples fro
 DEMO_DIR = os.environ.get("VLA_DEMO_DIR", "/kaggle/input/vla-demos/demos")
 LIBERO_DATASET_REPO = "physical-intelligence/libero"
 LIBERO_SPLIT = "train"
-LIBERO_MAX_SAMPLES = 5000                       # cap streaming download to keep Kaggle practical
+LIBERO_MAX_SAMPLES = 1000                       # cap streaming download to keep Kaggle practical
 OUTPUT_DIR = "/kaggle/working/openvla-finetuned"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -96,7 +96,7 @@ LORA_ALPHA = 64
 BATCH_SIZE = 2                    # T4 16GB constraint
 GRAD_ACCUM_STEPS = 8              # effective batch = 2 × 8 = 16
 LEARNING_RATE = 5e-4
-NUM_EPOCHS = 5
+NUM_EPOCHS = 1
 IMAGE_SIZE = 224                  # OpenVLA input resolution
 MAX_SEQ_LEN = 256
 SAVE_STEPS = 200
