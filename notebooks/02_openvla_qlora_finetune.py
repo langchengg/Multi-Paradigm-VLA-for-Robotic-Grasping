@@ -100,12 +100,14 @@ NUM_EPOCHS = 5
 IMAGE_SIZE = 224                  # OpenVLA input resolution
 MAX_SEQ_LEN = 256
 SAVE_STEPS = 200
+LOG_STEPS = 10
 
 print(f"✅ Config ready")
 print(f"   Model: {MODEL_NAME}")
 print(f"   LoRA rank: {LORA_RANK}, effective batch: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
 print(f"   Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
+print(f"   Log every {LOG_STEPS} optimizer steps")
 print(f"   Demo dir hint: {DEMO_DIR}")
 print(
     f"   LIBERO: {'enabled' if USE_LIBERO else 'disabled'}"
@@ -575,6 +577,8 @@ print(f"   Memory: {torch.cuda.memory_allocated()/1e9:.1f} GB")
 
 # Prepare for QLoRA training
 model = prepare_model_for_kbit_training(model)
+if hasattr(model, "config"):
+    model.config.use_cache = False
 
 # ═══════════════════════════════════════════════════════════════
 # Cell 5: Apply LoRA Adapters
@@ -674,7 +678,7 @@ for epoch in range(NUM_EPOCHS):
             optimizer.zero_grad()
             global_step += 1
 
-            if global_step % 50 == 0:
+            if global_step % LOG_STEPS == 0:
                 print(f"  Epoch {epoch+1}/{NUM_EPOCHS} | "
                       f"Step {global_step} | "
                       f"Loss: {loss.item() * GRAD_ACCUM_STEPS:.4f} | "

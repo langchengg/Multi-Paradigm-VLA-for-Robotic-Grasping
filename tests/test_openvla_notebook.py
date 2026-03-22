@@ -14,6 +14,9 @@ def test_openvla_notebook_pins_compatible_transformers_stack():
     assert 'f"numpy=={NUMPY_VERSION}"' in source
     assert "def verify_torch_numpy_bridge():" in source
     assert "torch.tensor([1.0]).numpy()" in source
+    assert "LOG_STEPS = 10" in source
+    assert 'model.config.use_cache = False' in source
+    assert 'if global_step % LOG_STEPS == 0:' in source
     assert '"--upgrade"' in source
 
 
