@@ -23,9 +23,33 @@ This notebook:
 # ═══════════════════════════════════════════════════════════════
 
 import json
+import io
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+NUMPY_VERSION = "1.26.4"
+
+
+def verify_torch_numpy_bridge():
+    """Fail early if Kaggle keeps a NumPy build incompatible with the pinned torch wheel."""
+    check_code = (
+        "import numpy as np, torch; "
+        "major = int(np.__version__.split('.')[0]); "
+        "assert major < 2, f'Expected NumPy < 2, found {np.__version__}'; "
+        "torch.tensor([1.0]).numpy(); "
+        "print(f'numpy={np.__version__} torch={torch.__version__}')"
+    )
+    try:
+        output = subprocess.check_output([sys.executable, "-c", check_code], text=True).strip()
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "PyTorch cannot convert tensors to NumPy in this environment. "
+            f"Pin numpy=={NUMPY_VERSION} before loading OpenVLA."
+        ) from exc
+    print(f"✅ Verified torch↔numpy bridge ({output})")
+
 
 def install():
     pkgs = [
@@ -38,11 +62,12 @@ def install():
         "peft==0.11.1",
         "bitsandbytes==0.43.1",
         "timm==0.9.10",
-        "numpy>=1.24.0",
+        f"numpy=={NUMPY_VERSION}",
         "wandb",
         "datasets",
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
+    verify_torch_numpy_bridge()
     print("✅ Official OpenVLA dependencies installed")
 
 install()
@@ -55,8 +80,12 @@ import os
 import torch
 
 # ──── Paths & Data Sources ────
-USE_LIBERO = True                               # Mix in LIBERO dataset from HF
-DEMO_DIR = "/kaggle/input/vla-demos/demos"      # your uploaded dataset (self-collected)
+PROJECT_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
+USE_LIBERO = True                               # Mix in real LIBERO samples from HF
+DEMO_DIR = os.environ.get("VLA_DEMO_DIR", "/kaggle/input/vla-demos/demos")
+LIBERO_DATASET_REPO = "physical-intelligence/libero"
+LIBERO_SPLIT = "train"
+LIBERO_MAX_SAMPLES = 5000                       # cap streaming download to keep Kaggle practical
 OUTPUT_DIR = "/kaggle/working/openvla-finetuned"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -77,6 +106,11 @@ print(f"   Model: {MODEL_NAME}")
 print(f"   LoRA rank: {LORA_RANK}, effective batch: {BATCH_SIZE * GRAD_ACCUM_STEPS}")
 print(f"   Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
+print(f"   Demo dir hint: {DEMO_DIR}")
+print(
+    f"   LIBERO: {'enabled' if USE_LIBERO else 'disabled'}"
+    + (f" ({LIBERO_DATASET_REPO}, max {LIBERO_MAX_SAMPLES} samples)" if USE_LIBERO else "")
+)
 
 # ──── Franka Delta-Pose Action Semantics ────
 FRANKA_ACTION_KEYS = ("dx", "dy", "dz", "dax", "day", "daz", "gripper")
@@ -241,6 +275,96 @@ from PIL import Image
 import glob
 
 
+def resolve_demo_dir(preferred_dir):
+    """Find the first directory that actually contains demo_*.npz files."""
+    candidates = []
+    seen = set()
+
+    def add_candidate(path_like):
+        if not path_like:
+            return
+        path = os.path.abspath(os.fspath(path_like))
+        if path not in seen:
+            candidates.append(path)
+            seen.add(path)
+
+    add_candidate(preferred_dir)
+    add_candidate(os.environ.get("VLA_DEMO_DIR"))
+    add_candidate("/kaggle/input/vla-demos/demos")
+    add_candidate("/kaggle/input/vla-demos")
+    add_candidate("/kaggle/working/demos")
+    add_candidate(PROJECT_ROOT / "data" / "demos")
+
+    for pattern in ("/kaggle/input/*/demos", "/kaggle/input/*"):
+        for match in sorted(glob.glob(pattern)):
+            add_candidate(match)
+
+    for candidate in candidates:
+        if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "demo_*.npz")):
+            return candidate
+    return None
+
+
+def image_to_uint8_array(image, source_name):
+    """Normalize PIL / HF image feature outputs to HWC uint8 arrays."""
+    if isinstance(image, Image.Image):
+        arr = np.array(image.convert("RGB"), dtype=np.uint8)
+    elif isinstance(image, dict):
+        if image.get("bytes") is not None:
+            arr = np.array(Image.open(io.BytesIO(image["bytes"])).convert("RGB"), dtype=np.uint8)
+        elif image.get("path"):
+            arr = np.array(Image.open(image["path"]).convert("RGB"), dtype=np.uint8)
+        else:
+            raise ValueError(f"Unsupported image payload in {source_name}: {image.keys()}")
+    else:
+        arr = np.asarray(image)
+        if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+            arr = np.transpose(arr, (1, 2, 0))
+        if arr.ndim != 3:
+            raise ValueError(f"Expected image with 3 dims in {source_name}, got shape {arr.shape}")
+        if arr.shape[-1] == 1:
+            arr = np.repeat(arr, 3, axis=-1)
+        if arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.floating) and arr.size and arr.max() <= 1.0:
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return arr
+
+
+def sample_get(sample, *paths):
+    """Retrieve a possibly nested value from a HF sample dict."""
+    for path in paths:
+        value = sample
+        found = True
+        for key in path.split("."):
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                found = False
+                break
+        if found and value is not None:
+            return value
+    return None
+
+
+def load_libero_task_lookup(repo_id):
+    """Map LIBERO task indices to natural-language instructions."""
+    from huggingface_hub import hf_hub_download
+
+    tasks_path = hf_hub_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        filename="meta/tasks.jsonl",
+    )
+    task_lookup = {}
+    with open(tasks_path, "r") as f:
+        for line in f:
+            if line.strip():
+                record = json.loads(line)
+                task_lookup[int(record["task_index"])] = record["task"]
+    return task_lookup
+
+
 class VLADemoDataset(Dataset):
     """
     PyTorch Dataset for VLA fine-tuning from collected .npz demos.
@@ -257,14 +381,16 @@ class VLADemoDataset(Dataset):
     [dx, dy, dz, 0, 0, 0, gripper]
     """
 
-    def __init__(self, demo_dir, image_size=224, augment=True):
+    def __init__(self, demo_dir, image_size=224, augment=True, use_libero=False):
         self.image_size = image_size
         self.augment = augment
+        self.source_counts = {}
+        self.demo_dir = resolve_demo_dir(demo_dir)
 
         # Load all self-collected demos (MuJoCo)
         self.samples = []
-        if os.path.exists(demo_dir):
-            demo_files = sorted(glob.glob(os.path.join(demo_dir, "demo_*.npz")))
+        if self.demo_dir is not None:
+            demo_files = sorted(glob.glob(os.path.join(self.demo_dir, "demo_*.npz")))
             for f in demo_files:
                 data = np.load(f, allow_pickle=True)
                 if not data.get("success", False):
@@ -282,21 +408,83 @@ class VLADemoDataset(Dataset):
                         "action_7d": action_7d,           # (7,) float
                         "source": "mujoco",
                     })
-            print(f"  Loaded {len(self.samples)} samples from {len(demo_files)} self-collected demos")
+            self.source_counts["mujoco"] = len(self.samples)
+            print(
+                f"  Loaded {self.source_counts['mujoco']} samples from "
+                f"{len(demo_files)} self-collected demos in {self.demo_dir}"
+            )
+        else:
+            print("  No self-collected demos found under Kaggle input/working directories.")
 
-        # Load LIBERO dataset from HuggingFace (simulated structure)
-        if USE_LIBERO:
-            print("  Downloading LIBERO dataset from HuggingFace...")
+        # Load real LIBERO dataset from HuggingFace
+        if use_libero and LIBERO_MAX_SAMPLES > 0:
+            print(
+                f"  Streaming up to {LIBERO_MAX_SAMPLES} real LIBERO samples "
+                f"from {LIBERO_DATASET_REPO}..."
+            )
             try:
                 from datasets import load_dataset
-                # Placeholder for actual LIBERO path. Simulated loading:
-                # libero_ds = load_dataset("libero-project/libero-10-tasks", split="train")
-                print("  [Note: In real run, would load 10 tasks × 50 demos = 500 trajectories]")
-                # We simulate adding LIBERO data here to match architectural requirement
-                simulated_libero_samples = 25000  # ~50 steps * 500 demos
-                print(f"  Simulated loading {simulated_libero_samples} LIBERO samples.")
-            except ImportError:
-                print("  ⚠️ `datasets` library not installed. Skipping LIBERO.")
+                task_lookup = load_libero_task_lookup(LIBERO_DATASET_REPO)
+                libero_ds = load_dataset(
+                    LIBERO_DATASET_REPO,
+                    split=LIBERO_SPLIT,
+                    streaming=True,
+                )
+
+                libero_count = 0
+                for idx, sample in enumerate(libero_ds):
+                    image = sample_get(
+                        sample,
+                        "image",
+                        "observation.images.image",
+                        "observation.image",
+                    )
+                    action = sample_get(sample, "actions", "action")
+                    instruction = sample_get(
+                        sample,
+                        "task",
+                        "instruction",
+                        "language_instruction",
+                        "text",
+                    )
+                    if instruction is None:
+                        task_index = sample_get(sample, "task_index")
+                        if task_index is not None:
+                            instruction = task_lookup.get(int(task_index))
+
+                    if image is None or action is None or instruction is None:
+                        continue
+
+                    action_7d = ensure_franka_action_7d(
+                        action,
+                        source_name=f"{LIBERO_DATASET_REPO}:{idx}",
+                    )
+                    self.samples.append({
+                        "image": image_to_uint8_array(image, f"{LIBERO_DATASET_REPO}:{idx}"),
+                        "instruction": str(instruction),
+                        "action_7d": action_7d,
+                        "source": "libero",
+                    })
+                    libero_count += 1
+                    if libero_count >= LIBERO_MAX_SAMPLES:
+                        break
+
+                self.source_counts["libero"] = libero_count
+                print(
+                    f"  Loaded {libero_count} real LIBERO samples "
+                    f"from {LIBERO_DATASET_REPO}/{LIBERO_SPLIT}"
+                )
+            except Exception as exc:
+                print(f"  ⚠️ Failed to load LIBERO dataset: {type(exc).__name__}: {exc}")
+
+        if len(self.samples) == 0:
+            raise RuntimeError(
+                "Could not find any training samples. "
+                f"Tried DEMO_DIR={demo_dir!r}, resolved demo dir={self.demo_dir!r}, "
+                f"and LIBERO={'enabled' if use_libero else 'disabled'}. "
+                "Attach the Notebook 1 demos as a Kaggle Dataset or set VLA_DEMO_DIR "
+                "to a directory containing demo_*.npz files."
+            )
 
     def __len__(self):
         return len(self.samples)
@@ -335,17 +523,15 @@ def collate_vla_batch(batch):
 
 
 # Test dataset
-dataset = VLADemoDataset(DEMO_DIR, image_size=IMAGE_SIZE)
-if len(dataset) > 0:
-    print(f"  Total Dataset size: {len(dataset)} samples")
-    sample = dataset[0]
-    print(f"  Sample image: {sample['image'].size}")
-    print(f"  Sample instruction: '{sample['instruction']}'")
-    print(f"  Sample action (normalized): {sample['action']}")
-    print(f"  Sample action (serialized): {format_franka_action(sample['action'].numpy())}")
-    print(f"  Sample action (physical): {format_physical_delta(sample['action'].numpy())}")
-else:
-    print("⚠️ No data loaded! Check DEMO_DIR or LIBERO fetching.")
+dataset = VLADemoDataset(DEMO_DIR, image_size=IMAGE_SIZE, use_libero=USE_LIBERO)
+print(f"  Total Dataset size: {len(dataset)} samples")
+print(f"  Source counts: {dataset.source_counts}")
+sample = dataset[0]
+print(f"  Sample image: {sample['image'].size}")
+print(f"  Sample instruction: '{sample['instruction']}'")
+print(f"  Sample action (normalized): {sample['action']}")
+print(f"  Sample action (serialized): {format_franka_action(sample['action'].numpy())}")
+print(f"  Sample action (physical): {format_physical_delta(sample['action'].numpy())}")
 
 # ═══════════════════════════════════════════════════════════════
 # Cell 4: Load OpenVLA with QLoRA (4-bit quantization)

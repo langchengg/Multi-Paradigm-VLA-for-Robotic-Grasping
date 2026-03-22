@@ -29,6 +29,10 @@ def test_notebook2_uses_native_7d_actions_with_legacy_fallback():
 def test_notebook3_uses_franka_env_and_true_7d_sampling():
     source = (ROOT / "notebooks" / "03_flow_matching_eval.py").read_text()
 
+    assert 'NUMPY_VERSION = "1.26.4"' in source
+    assert 'f"numpy=={NUMPY_VERSION}"' in source
+    assert "def verify_torch_numpy_bridge():" in source
+    assert "torch.tensor([1.0]).numpy()" in source
     assert "from envs.franka_grasp_env import FrankaGraspEnv" in source
     assert 'env = FrankaGraspEnv(image_size=256, camera_name="frontview")' in source
     assert "self.action_dim = action_dim" in source

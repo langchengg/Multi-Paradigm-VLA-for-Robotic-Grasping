@@ -10,7 +10,27 @@ def test_openvla_notebook_pins_compatible_transformers_stack():
     assert '"transformers==4.40.1"' in source
     assert '"tokenizers==0.19.1"' in source
     assert '"timm==0.9.10"' in source
+    assert 'NUMPY_VERSION = "1.26.4"' in source
+    assert 'f"numpy=={NUMPY_VERSION}"' in source
+    assert "def verify_torch_numpy_bridge():" in source
+    assert "torch.tensor([1.0]).numpy()" in source
     assert '"--upgrade"' in source
+
+
+def test_openvla_notebook_loads_real_data_instead_of_simulating_libero():
+    notebook_path = (
+        Path(__file__).resolve().parents[1] / "notebooks" / "02_openvla_qlora_finetune.py"
+    )
+    source = notebook_path.read_text()
+
+    assert 'LIBERO_DATASET_REPO = "physical-intelligence/libero"' in source
+    assert "LIBERO_MAX_SAMPLES = 5000" in source
+    assert "def resolve_demo_dir(preferred_dir):" in source
+    assert 'load_dataset(' in source
+    assert 'streaming=True' in source
+    assert 'load_libero_task_lookup(LIBERO_DATASET_REPO)' in source
+    assert 'Simulated loading' not in source
+    assert "Could not find any training samples." in source
 
 
 def test_openvla_notebook_uses_vision_model_fallback_and_real_demo_key():

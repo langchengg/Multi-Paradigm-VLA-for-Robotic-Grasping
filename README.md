@@ -315,6 +315,9 @@ Upload files to Kaggle and run the 3 notebooks in order:
 **Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA (4-bit quantization, LoRA rank=32)  
 **Notebook 3** → Trains lightweight FlowMatchingVLA (117M params) + closed-loop eval → GIFs
 
+If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The Notebook 2 and 3 install cells do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.
+Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 5000 real samples from [`physical-intelligence/libero`](https://huggingface.co/datasets/physical-intelligence/libero) using its official task map [`meta/tasks.jsonl`](https://huggingface.co/datasets/physical-intelligence/libero/blob/main/meta/tasks.jsonl). If neither source yields data, it fails immediately instead of pretending LIBERO was loaded.
+
 ### Step 6: View Results
 
 ```bash

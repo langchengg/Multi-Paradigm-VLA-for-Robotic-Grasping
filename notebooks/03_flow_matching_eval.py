@@ -29,6 +29,28 @@ import subprocess
 import sys
 from pathlib import Path
 
+NUMPY_VERSION = "1.26.4"
+
+
+def verify_torch_numpy_bridge():
+    """Fail early if Kaggle keeps a NumPy build incompatible with the pinned torch wheel."""
+    check_code = (
+        "import numpy as np, torch; "
+        "major = int(np.__version__.split('.')[0]); "
+        "assert major < 2, f'Expected NumPy < 2, found {np.__version__}'; "
+        "torch.tensor([1.0]).numpy(); "
+        "print(f'numpy={np.__version__} torch={torch.__version__}')"
+    )
+    try:
+        output = subprocess.check_output([sys.executable, "-c", check_code], text=True).strip()
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "PyTorch cannot convert tensors to NumPy in this environment. "
+            f"Pin numpy=={NUMPY_VERSION} before running Notebook 3."
+        ) from exc
+    print(f"✅ Verified torch↔numpy bridge ({output})")
+
+
 def install():
     pkgs = [
         "torch==2.2.0",
@@ -41,11 +63,12 @@ def install():
         "timm==0.9.10",
         "mujoco>=3.0.0",
         "Pillow>=9.0.0",
-        "numpy>=1.24.0",
+        f"numpy=={NUMPY_VERSION}",
         "matplotlib>=3.7.0",
         "imageio>=2.30.0",
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
+    verify_torch_numpy_bridge()
     subprocess.run(
                    "apt-get update -qq && apt-get install -y -qq "
                    "libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev "
