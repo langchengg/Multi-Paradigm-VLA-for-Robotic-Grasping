@@ -21,12 +21,43 @@ VLA models (Vision-Language-Action) take in camera images + language instruction
 方法C: 流匹配 (Flow-Matching)   ── Physical Intelligence π0 用的
 ```
 
-## 🎬 Demo
+## ✅ Recommended Run Order
 
-| Expert Policy | Autoregressive | Diffusion | Flow-Matching |
-|:---:|:---:|:---:|:---:|
-| ![expert](assets/expert_demo.gif) | ![auto](assets/autoregressive/episode_000_green_cube.gif) | ![diff](assets/diffusion/episode_000_red_cube.gif) | ![flow](assets/flow_matching/episode_000_red_cube.gif) |
-| Scripted: 100% | DummyVLA: 100% | DummyVLA: 100% | **DummyVLA: 100%** |
+### A. 本地快速自检
+
+```bash
+# 1) 安装 Python 依赖
+pip install -r requirements.txt
+
+# 2) Headless Linux / Kaggle 需要的 OpenGL 依赖
+apt-get update -qq && apt-get install -y -qq \
+  libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev \
+  libosmesa6-dev libglew-dev patchelf
+
+# 3) 验证 Franka Panda 环境
+python -m envs.franka_grasp_env
+
+# 4) 跑关键测试
+python -m pytest -q \
+  tests/test_env.py \
+  tests/test_rendering.py \
+  tests/test_notebooks_franka.py \
+  tests/test_openvla_notebook.py \
+  tests/test_flow_matching_head.py
+
+# 5) 跑本地 quick pipeline
+python scripts/run_demo.py --quick
+```
+
+### B. Kaggle 完整链路
+
+固定顺序：
+
+1. `notebooks/01_env_setup_and_demo.py`
+2. `notebooks/02_openvla_qlora_finetune.py`
+3. `notebooks/03_flow_matching_eval.py`
+
+如果 `Notebook 1` 和 `Notebook 2` 不在同一个 Kaggle session 里运行，需要先把 `/kaggle/working/demos/` 上传成 Dataset，再挂载给 `Notebook 2`。
 
 ---
 
@@ -106,21 +137,58 @@ OpenVLA 生成动作也一样:
 
 ---
 
-## 📊 Benchmark Results
+## 📦 Outputs After Running
 
-| | Autoregressive (OpenVLA) | Diffusion | **Flow-Matching (π0)** |
-|---|:---:|:---:|:---:|
-| **方法** | Token-by-token 分类 | 迭代去噪 (DDPM/DDIM) | ODE 直线积分 |
-| **灵感来源** | OpenVLA | Diffusion Policy | π0 (Physical Intelligence) |
-| **成功率** ¹ | ~72% | ~78% | **~85%** |
-| **推理延迟** ¹ | ~180ms | ~95ms | **~42ms** |
-| **训练收敛步数** | ~5000 | ~3500 | **~3000** |
-| **动作平滑度** | 差 (单步突变) | 好 (H=4 chunk) | 好 (H=4 chunk) |
-| **动作精度** | 256 bins 离散 | 连续 (∞) | 连续 (∞) |
+README 首页不再展示仓库里预置的 demo GIF，而是展示你跑完后会实际得到什么。
 
-> ¹ 期望数据：成功率和延迟为 Kaggle T4 上用真实 VLA 模型推理的预期值。本地 `scripts/run_demo.py` 使用 DummyVLA (oracle heuristic policy)，3 个 decoder 均为 100% 成功率。真实基准结果需在 Kaggle 上运行 Notebook 2+3 获得。
+### 本地运行 `python scripts/run_demo.py --quick`
 
-**Key Finding**: Flow-matching 在速度和成功率上都优于其他方法：推理速度是自回归的 **5×**，并且连续空间输出避免了离散化误差。
+会生成这些结果：
+
+```text
+assets/
+  initial_frame.png
+  view_frontview.png
+  view_topdown.png
+  view_sideview.png
+  expert_demo.gif
+  autoregressive/episode_000_*.gif
+  autoregressive/eval_results.txt
+  diffusion/episode_000_*.gif
+  diffusion/eval_results.txt
+  flow_matching/episode_000_*.gif
+  flow_matching/eval_results.txt
+  trajectories_3d.png
+  trajectories_2d.png
+  success_heatmap.png
+data/demos/
+  demo_0000.npz
+  demo_0001.npz
+  ...
+assets_quick.zip
+```
+
+终端还会打印每个 decoder 的闭环结果摘要：
+
+```text
+autoregressive: success=..., latency=...ms
+diffusion:      success=..., latency=...ms
+flow_matching:  success=..., latency=...ms
+```
+
+### Kaggle 跑完 3 个 Notebook
+
+你会在 `/kaggle/working/` 拿到：
+
+1. `demos/demo_*.npz`
+2. `expert_demo.gif`
+3. `openvla-finetuned/final/`
+4. `openvla-finetuned/final/franka_action_config.json`
+5. `results/flow_matching_vla.pt`
+6. `results/training_curve.png`
+7. `results/flow_matching_ep0.gif` 到 `results/flow_matching_ep4.gif`
+8. `results/flow_trajectories_3d.png`
+9. `results/technical_report.md`
 
 ---
 
@@ -244,8 +312,11 @@ Upload files to Kaggle and run the 3 notebooks in order:
 
 ```bash
 ls assets/
-# → expert_demo.gif, autoregressive/, diffusion/, flow_matching/
-#   trajectories_3d.png, success_heatmap.png
+ls data/demos/ | head
+ls -lh assets_quick.zip
+# → initial_frame.png, view_*.png, expert_demo.gif,
+#   autoregressive/, diffusion/, flow_matching/,
+#   trajectories_3d.png, trajectories_2d.png, success_heatmap.png
 ```
 
 ---
@@ -359,8 +430,8 @@ For each episode (50 episodes per decoder):
   2. Select target object + language instruction
   3. Loop (max 150 steps):
      a. Camera renders 256×256 RGB image
-     b. VLA model: image + "pick up the red cube" → action (dx,dy,dz,gripper)
-     c. Jacobian IK: Cartesian action → 7-DOF joint commands
+     b. VLA model: image + instruction → action [dx,dy,dz,dax,day,daz,gripper]
+     c. Jacobian IK: delta-pose action → 7-DOF joint commands
      d. MuJoCo physics simulation (20 substeps)
      e. Check: object lifted above 0.35m? → Success!
   4. Record: success/failure, trajectory, frames → GIF
