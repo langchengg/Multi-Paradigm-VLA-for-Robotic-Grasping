@@ -10,6 +10,7 @@ def test_notebook1_collects_franka_demos():
     assert "from envs.franka_grasp_env import FrankaGraspEnv" in source
     assert "from data.collect_demos import collect_demos" in source
     assert 'env = FrankaGraspEnv(image_size=IMAGE_SIZE, camera_name="frontview")' in source
+    assert "add_noise=False" in source
     assert "Action format: 7-DOF" in source
     assert "env = SimpleGraspEnv(image_size=IMAGE_SIZE)" not in source
 

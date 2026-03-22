@@ -33,7 +33,7 @@ def test_openvla_notebook_supervises_structured_franka_delta_pose_targets():
     source = notebook_path.read_text()
 
     assert 'FRANKA_ACTION_KEYS = ("dx", "dy", "dz", "dax", "day", "daz", "gripper")' in source
-    assert "TRANSLATION_STEP_M = 0.015" in source
+    assert "TRANSLATION_STEP_M = 0.03" in source
     assert "ROTATION_STEP_RAD = 0.05" in source
     assert "def format_franka_action(action):" in source
     assert "def parse_franka_action(text):" in source

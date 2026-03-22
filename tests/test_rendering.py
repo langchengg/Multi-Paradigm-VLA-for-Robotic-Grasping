@@ -159,6 +159,84 @@ def test_franka_env_smoke_with_fake_renderer(monkeypatch):
         env.close()
 
 
+def test_franka_env_cartesian_z_command_moves_down(monkeypatch):
+    from envs import franka_grasp_env as franka_module
+
+    class FakeRenderer:
+        def __init__(self, _mujoco, _model, height, width):
+            self.height = height
+            self.width = width
+
+        def update_scene(self, _data, camera=None):
+            self.camera = camera
+
+        def render(self):
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        franka_module,
+        "create_renderer",
+        lambda mujoco, model, *, height, width: FakeRenderer(mujoco, model, height, width),
+    )
+
+    env = franka_module.FrankaGraspEnv(image_size=32, camera_name="frontview")
+    try:
+        env.reset(target_object="red_cube", randomize=False)
+        start = env._get_ee_pos().copy()
+        for _ in range(10):
+            env.step(np.array([0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]))
+        delta = env._get_ee_pos() - start
+        assert delta[2] < -0.04
+    finally:
+        env.close()
+
+
+def test_franka_scripted_rollout_succeeds_deterministically(monkeypatch):
+    from data.collect_demos import scripted_grasp_policy
+    from envs import franka_grasp_env as franka_module
+
+    class FakeRenderer:
+        def __init__(self, _mujoco, _model, height, width):
+            self.height = height
+            self.width = width
+
+        def update_scene(self, _data, camera=None):
+            self.camera = camera
+
+        def render(self):
+            return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        franka_module,
+        "create_renderer",
+        lambda mujoco, model, *, height, width: FakeRenderer(mujoco, model, height, width),
+    )
+
+    env = franka_module.FrankaGraspEnv(image_size=32, camera_name="frontview")
+    try:
+        obs = env.reset(target_object="red_cube", randomize=False)
+        target_pos = obs["target_pos"].copy()
+        phase = 0
+        phase_step = 0
+        info = {"success": False}
+
+        for _ in range(env._max_steps):
+            action, phase, phase_step = scripted_grasp_policy(obs, phase, phase_step, target_pos)
+            obs, _reward, done, info = env.step(np.clip(action, -1.0, 1.0))
+            if done:
+                break
+
+        assert bool(info["success"]) is True
+    finally:
+        env.close()
+
+
 def test_envs_package_runs_shared_rendering_config(monkeypatch):
     import envs
 

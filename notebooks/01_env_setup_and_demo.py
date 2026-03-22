@@ -107,8 +107,8 @@ demos, stats = collect_demos(
     env,
     num_demos=NUM_DEMOS,
     save_dir=SAVE_DIR,
-    add_noise=True,
-    noise_std=0.03,
+    add_noise=False,
+    noise_std=0.0,
     verbose=True,
 )
 env.close()

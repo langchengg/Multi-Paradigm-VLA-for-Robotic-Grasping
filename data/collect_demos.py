@@ -13,11 +13,13 @@ from pathlib import Path
 
 def scripted_grasp_policy(obs, phase, phase_step, target_pos):
     """
-    Simple scripted grasping policy with 4 phases:
-    1. Approach: Move above the target object
-    2. Descend: Lower to grasp position
-    3. Grasp: Close fingers
-    4. Lift: Raise the grasped object
+    Scripted 7-DOF grasping policy tuned for the Franka Cartesian controller.
+
+    Phases:
+    1. Approach: move to a pre-grasp pose above the object
+    2. Descend: lower to a near-contact grasp pose
+    3. Grasp: keep pose aligned while closing the fingers
+    4. Lift: raise the object while holding xy over the target
 
     Args:
         obs: current observation dict
@@ -32,54 +34,47 @@ def scripted_grasp_policy(obs, phase, phase_step, target_pos):
     """
     gripper_pos = obs["gripper_pos"]
 
-    if phase == 0:
-        # Phase 0: Move above target
-        goal = target_pos.copy()
-        goal[2] += 0.15  # 15cm above
-        direction = goal - gripper_pos
-        action = np.zeros(7)
-        action[:3] = direction * 5.0  # P-gain
-        action[3:6] = 0.0  # no rotation
-        action[6] = -1.0  # open gripper
+    action = np.zeros(7, dtype=np.float32)
 
-        if np.linalg.norm(direction) < 0.02 or phase_step > 30:
+    if phase == 0:
+        goal = target_pos.copy()
+        goal[2] += 0.07
+        direction = goal - gripper_pos
+        action[:3] = direction * np.array([8.0, 8.0, 7.0], dtype=np.float32)
+        action[6] = -1.0
+
+        if np.linalg.norm(direction) < 0.018 or phase_step >= 35:
             return action, 1, 0
         return action, 0, phase_step + 1
 
-    elif phase == 1:
-        # Phase 1: Descend to object
+    if phase == 1:
         goal = target_pos.copy()
-        goal[2] += 0.02  # 2cm above (contact height)
+        goal[2] += 0.015
         direction = goal - gripper_pos
-        action = np.zeros(7)
-        action[:3] = direction * 4.0
-        action[3:6] = 0.0  # no rotation
-        action[6] = -1.0  # open gripper
+        action[:3] = direction * np.array([7.0, 7.0, 6.0], dtype=np.float32)
+        action[6] = -1.0
 
-        if np.linalg.norm(direction) < 0.015 or phase_step > 25:
+        if np.linalg.norm(direction) < 0.012 or phase_step >= 35:
             return action, 2, 0
         return action, 1, phase_step + 1
 
-    elif phase == 2:
-        # Phase 2: Close gripper
-        action = np.zeros(7)
-        action[6] = 1.0  # close gripper
+    if phase == 2:
+        goal = target_pos.copy()
+        goal[2] += 0.01
+        direction = goal - gripper_pos
+        action[:3] = direction * np.array([4.0, 4.0, 3.0], dtype=np.float32)
+        action[6] = 1.0
 
-        if phase_step > 10:
+        if phase_step >= 15:
             return action, 3, 0
         return action, 2, phase_step + 1
 
-    else:
-        # Phase 3: Lift
-        goal = gripper_pos.copy()
-        goal[2] = 0.6  # lift target height
-        direction = goal - gripper_pos
-        action = np.zeros(7)
-        action[:3] = direction * 3.0
-        action[3:6] = 0.0  # no rotation
-        action[6] = 1.0  # keep gripper closed
-
-        return action, 3, phase_step + 1
+    goal = target_pos.copy()
+    goal[2] = 0.56
+    direction = goal - gripper_pos
+    action[:3] = direction * np.array([3.5, 3.5, 4.5], dtype=np.float32)
+    action[6] = 1.0
+    return action, 3, phase_step + 1
 
 
 def collect_demos(env, num_demos=50, save_dir="data/demos", add_noise=True,
@@ -122,7 +117,9 @@ def collect_demos(env, num_demos=50, save_dir="data/demos", add_noise=True,
         phase_step = 0
         target_pos = obs["target_pos"].copy()
 
-        for step in range(150):
+        max_steps = getattr(env, "_max_steps", 150)
+
+        for step in range(max_steps):
             # Record observation
             trajectory["images"].append(obs["image"])
             trajectory["instructions"].append(obs["instruction"])
@@ -230,8 +227,8 @@ if __name__ == "__main__":
         env,
         num_demos=20,  # small number for quick test
         save_dir=str(project_root / "data" / "demos"),
-        add_noise=True,
-        noise_std=0.03,
+        add_noise=False,
+        noise_std=0.0,
     )
 
     env.close()

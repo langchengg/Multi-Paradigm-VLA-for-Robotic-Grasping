@@ -118,8 +118,8 @@ def main(quick=False, use_simple=False, use_viewer=False):
         env,
         num_demos=num_demos,
         save_dir=str(demos_dir),
-        add_noise=True,
-        noise_std=0.03,
+        add_noise=False,
+        noise_std=0.0,
     )
 
     # Save best demo as GIF

@@ -80,7 +80,7 @@ print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else
 
 # ──── Franka Delta-Pose Action Semantics ────
 FRANKA_ACTION_KEYS = ("dx", "dy", "dz", "dax", "day", "daz", "gripper")
-TRANSLATION_STEP_M = 0.015
+TRANSLATION_STEP_M = 0.03
 ROTATION_STEP_RAD = 0.05
 GRIPPER_OPEN_VALUE = -1.0
 GRIPPER_CLOSE_VALUE = 1.0

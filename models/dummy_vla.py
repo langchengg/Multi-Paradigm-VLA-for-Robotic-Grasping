@@ -118,56 +118,56 @@ class DummyVLA:
         """
         Phase-based grasping policy matching the expert scripted policy.
         Uses the same approach→descend→grasp→lift strategy.
-        Actions are in [-1, 1] and get scaled by env (0.02m per unit).
+        Actions are in [-1, 1] and get scaled by the Franka env controller.
         """
         action = np.zeros(self.action_dim)
         self._phase_step += 1
 
         if self._phase == 0:
-            # Phase 0: Move above target
             goal = target_pos.copy()
-            goal[2] += 0.15
+            goal[2] += 0.07
             direction = goal - gripper_pos
-            action[:3] = direction * 5.0  # P-gain
-            action[3:6] = 0.0  # no rotation
-            action[6] = -1.0  # open gripper
-            if np.linalg.norm(direction) < 0.02 or self._phase_step > 30:
+            action[:3] = direction * np.array([8.0, 8.0, 7.0])
+            action[3:6] = 0.0
+            action[6] = -1.0
+            if np.linalg.norm(direction) < 0.018 or self._phase_step > 35:
                 self._phase = 1
                 self._phase_step = 0
 
         elif self._phase == 1:
-            # Phase 1: Descend to object
             goal = target_pos.copy()
-            goal[2] += 0.02
+            goal[2] += 0.015
             direction = goal - gripper_pos
-            action[:3] = direction * 4.0
-            action[3:6] = 0.0  # no rotation
-            action[6] = -1.0  # open
-            if np.linalg.norm(direction) < 0.015 or self._phase_step > 25:
+            action[:3] = direction * np.array([7.0, 7.0, 6.0])
+            action[3:6] = 0.0
+            action[6] = -1.0
+            if np.linalg.norm(direction) < 0.012 or self._phase_step > 35:
                 self._phase = 2
                 self._phase_step = 0
 
         elif self._phase == 2:
-            # Phase 2: Close gripper
-            action[6] = 1.0  # close
-            if self._phase_step > 10:
+            goal = target_pos.copy()
+            goal[2] += 0.01
+            direction = goal - gripper_pos
+            action[:3] = direction * np.array([4.0, 4.0, 3.0])
+            action[6] = 1.0
+            if self._phase_step > 15:
                 self._phase = 3
                 self._phase_step = 0
 
         else:
-            # Phase 3: Lift
-            goal = gripper_pos.copy()
-            goal[2] = 0.6
+            goal = target_pos.copy()
+            goal[2] = 0.56
             direction = goal - gripper_pos
-            action[:3] = direction * 3.0
-            action[3:6] = 0.0  # no rotation
-            action[6] = 1.0  # keep closed
+            action[:3] = direction * np.array([3.5, 3.5, 4.5])
+            action[3:6] = 0.0
+            action[6] = 1.0
 
         # Add decoder-specific noise (less noise → better success)
         noise_scale = {
-            "autoregressive": 0.08,
-            "diffusion": 0.05,
-            "flow_matching": 0.02,
+            "autoregressive": 0.05,
+            "diffusion": 0.03,
+            "flow_matching": 0.01,
         }[self.decoder_type]
 
         action[:3] += np.random.normal(0, noise_scale, 3)

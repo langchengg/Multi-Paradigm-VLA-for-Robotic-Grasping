@@ -39,7 +39,7 @@ class FrankaGraspEnv:
 
     Action space: (7,) float32 (also accepts (4,) for backward compatibility)
         [dx, dy, dz, dax, day, daz, gripper] in [-1, 1]
-        dx/dy/dz: end-effector Cartesian velocity (scaled by 0.015m/step)
+        dx/dy/dz: end-effector Cartesian velocity (scaled by 0.03m/step)
         dax/day/daz: end-effector angular velocity (scaled by 0.05rad/step)
         gripper: >0 close, <0 open
 
@@ -267,6 +267,9 @@ class FrankaGraspEnv:
 
     # Home joint configuration (arm pointing forward and down, ready to grasp)
     HOME_QPOS = np.array([0.0, -0.3, 0.0, -2.2, 0.0, 2.0, 0.785])
+    TRANSLATION_STEP_M = 0.03
+    ROTATION_STEP_RAD = 0.05
+    CONTROL_SUBSTEPS = 60
 
     INSTRUCTIONS = {
         "red_cube": ["pick up the red cube", "grasp the red block",
@@ -380,6 +383,10 @@ class FrankaGraspEnv:
         dq = J.T @ np.linalg.solve(JJT, dx)
         return dq
 
+    def _apply_gravity_compensation(self):
+        """Cancel generalized gravity/bias forces before each physics step."""
+        self.data.qfrc_applied[:self.model.nv] = self.data.qfrc_bias[:self.model.nv]
+
     def reset(self, target_object=None, randomize=True):
         """Reset environment."""
         mujoco.mj_resetData(self.model, self.data)
@@ -407,8 +414,11 @@ class FrankaGraspEnv:
                 self.data.qpos[a+3] = 1.0
                 self.data.qpos[a+4:a+7] = 0.0
 
+        mujoco.mj_forward(self.model, self.data)
+
         # Settle the simulation
         for _ in range(200):
+            self._apply_gravity_compensation()
             mujoco.mj_step(self.model, self.data)
         self.sync_viewer()
 
@@ -438,8 +448,8 @@ class FrankaGraspEnv:
                                0.0, 0.0, 0.0, action[3]])
 
         # Convert Cartesian + rotation delta to joint delta via IK
-        cart_delta = action[:3] * 0.015   # scale to meters
-        rot_delta = action[3:6] * 0.05    # scale to radians
+        cart_delta = action[:3] * self.TRANSLATION_STEP_M
+        rot_delta = action[3:6] * self.ROTATION_STEP_RAD
         dq = self._ik_step(cart_delta, rot_delta)
 
         # Update joint position targets
@@ -458,7 +468,8 @@ class FrankaGraspEnv:
         self.data.ctrl[self._act_ids["act_finger_r"]] = self._finger_target
 
         # Simulate
-        for _ in range(20):
+        for _ in range(self.CONTROL_SUBSTEPS):
+            self._apply_gravity_compensation()
             mujoco.mj_step(self.model, self.data)
         self.sync_viewer()
 
