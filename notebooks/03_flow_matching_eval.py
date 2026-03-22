@@ -112,9 +112,11 @@ class FlowMatchingHead(nn.Module):
     Inference: Euler ODE from noise → action in K steps.
     """
 
-    def __init__(self, feature_dim, action_dim=4, horizon=4,
+    def __init__(self, feature_dim, action_dim=7, horizon=4,
                  hidden_dim=512, num_layers=4):
         super().__init__()
+        self.action_dim = action_dim
+        self.horizon = horizon
         self.total_dim = action_dim * horizon
 
         self.feat_proj = nn.Sequential(
@@ -164,7 +166,7 @@ class FlowMatchingHead(nn.Module):
         return loss, {'flow_loss': loss.item()}
 
     @torch.no_grad()
-    def sample(self, features, action_dim=4, horizon=4, steps=10):
+    def sample(self, features, steps=10):
         """Inference: Euler ODE integration."""
         B = features.shape[0]
         feat = self.feat_proj(features)
@@ -177,7 +179,7 @@ class FlowMatchingHead(nn.Module):
             v = self.vel_net(torch.cat([x, t_emb, feat], dim=-1))
             x = x + v * dt
 
-        actions = self.denormalize(x.reshape(B, horizon, action_dim))
+        actions = self.denormalize(x.reshape(B, self.horizon, self.action_dim))
         return actions
 
 # ═══════════════════════════════════════════════════════════════
@@ -195,7 +197,7 @@ class FlowMatchingVLA(nn.Module):
     Total: ~117M params — trains easily on T4
     """
 
-    def __init__(self, action_dim=4, horizon=4):
+    def __init__(self, action_dim=7, horizon=4):
         super().__init__()
         # Vision encoder
         self.vision = ViTModel.from_pretrained("google/vit-base-patch16-224")
@@ -290,16 +292,28 @@ class FlowDemoDataset(Dataset):
                 continue
             images = data["images"]
             actions = data["actions"]
-            instr = str(data["instruction"])
+            instructions = data["instructions"]
 
             # Create samples with action horizons
             for t in range(len(actions) - horizon + 1):
+                action_chunk = actions[t:t+horizon]
+                if action_chunk.shape[-1] == 4:
+                    padded = np.zeros((horizon, ACTION_DIM), dtype=np.float32)
+                    padded[:, :3] = action_chunk[:, :3]
+                    padded[:, 6] = action_chunk[:, 3]
+                    action_chunk = padded
+                elif action_chunk.shape[-1] != ACTION_DIM:
+                    raise ValueError(
+                        f"Unsupported demo action dim {action_chunk.shape[-1]} in {f}. "
+                        f"Expected {ACTION_DIM} or legacy 4."
+                    )
+
                 self.samples.append({
                     "image": images[t],
-                    "instruction": instr,
-                    "actions": actions[t:t+horizon],  # (H, 4)
+                    "instruction": str(instructions[t]),
+                    "actions": action_chunk.astype(np.float32),  # (H, 7)
                 })
-                all_actions.append(actions[t])
+                all_actions.append(action_chunk[0])
 
         # Compute action stats
         all_actions = np.array(all_actions)
@@ -408,16 +422,7 @@ print(f"\n✅ Training complete! Final loss: {train_losses[-1]:.4f}")
 # Cell 7: MuJoCo Environment (same as Notebook 1)
 # ═══════════════════════════════════════════════════════════════
 
-# [Same SimpleGraspEnv class as Notebook 1 — included inline]
-# For brevity, importing from a shared module or duplicating here:
-
-# ... (SimpleGraspEnv class definition goes here — same as Notebook 1 Cell 3)
-# In practice, copy-paste the class from Notebook 1.
-# For this code, we use a compact version:
-
-from envs.simple_grasp_env import SimpleGraspEnv
-
-# If running standalone, paste the SimpleGraspEnv class from Notebook 1 here.
+from envs.franka_grasp_env import FrankaGraspEnv
 
 # ═══════════════════════════════════════════════════════════════
 # Cell 8: Closed-Loop VLA Evaluator
@@ -483,7 +488,7 @@ print("\n" + "=" * 60)
 print("Closed-Loop Evaluation: Flow-Matching VLA")
 print("=" * 60)
 
-env = SimpleGraspEnv(image_size=256)
+env = FrankaGraspEnv(image_size=256, camera_name="frontview")
 model.eval()
 evaluator = ClosedLoopEvaluator(model, env, model_type="flow")
 
@@ -579,12 +584,13 @@ robotic grasping in MuJoCo simulation. Compared three action decoding paradigms:
 autoregressive (OpenVLA-style), diffusion, and flow-matching (π0-inspired).
 
 ## 2. Environment
-- Custom MuJoCo grasping environment with actuator-controlled 3-DOF gripper
+- MuJoCo Franka Panda 7-DOF arm with parallel gripper
+- 7-DOF action interface: [dx, dy, dz, dax, day, daz, gripper]
 - 3 colored objects (red/blue/green cubes), 12 language instructions
-- 256×256 camera observations at 25Hz control frequency
+- 256×256 camera observations for closed-loop control
 
 ## 3. Data Collection
-- 100 expert demonstrations via scripted 4-phase grasping policy
+- 100 expert demonstrations via scripted 4-phase Franka grasping policy
 - Success rate: 100% (with domain randomization)
 - ~5000 image-action pairs for training
 

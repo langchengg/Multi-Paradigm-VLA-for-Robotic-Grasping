@@ -22,10 +22,14 @@ This notebook:
 # Cell 1: Install Dependencies
 # ═══════════════════════════════════════════════════════════════
 
-import subprocess, sys
+import json
+import re
+import subprocess
+import sys
 
 def install():
-        # Official OpenVLA dependencies
+    pkgs = [
+        # Official OpenVLA-compatible stack
         "torch==2.2.0",
         "torchvision==0.17.0",
         "transformers==4.40.1",
@@ -36,10 +40,10 @@ def install():
         "timm==0.9.10",
         "numpy>=1.24.0",
         "wandb",
-        "datasets", # For HuggingFace LIBERO datasets
+        "datasets",
     ]
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + pkgs)
-    print("✅ Official OpenVLA Dependencies installed")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
+    print("✅ Official OpenVLA dependencies installed")
 
 install()
 
@@ -74,6 +78,159 @@ print(f"   LoRA rank: {LORA_RANK}, effective batch: {BATCH_SIZE * GRAD_ACCUM_STE
 print(f"   Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
 
+# ──── Franka Delta-Pose Action Semantics ────
+FRANKA_ACTION_KEYS = ("dx", "dy", "dz", "dax", "day", "daz", "gripper")
+TRANSLATION_STEP_M = 0.015
+ROTATION_STEP_RAD = 0.05
+GRIPPER_OPEN_VALUE = -1.0
+GRIPPER_CLOSE_VALUE = 1.0
+ACTION_MIN = -1.0
+ACTION_MAX = 1.0
+
+
+def ensure_franka_action_7d(action, source_name="<unknown>"):
+    """Convert demo actions to the normalized 7-DOF Franka delta-pose format."""
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+    if action.shape[0] == 7:
+        return np.clip(action, ACTION_MIN, ACTION_MAX)
+    if action.shape[0] == 4:
+        return np.array(
+            [action[0], action[1], action[2], 0.0, 0.0, 0.0, action[3]],
+            dtype=np.float32,
+        )
+    raise ValueError(
+        f"Unsupported action dimension {action.shape[0]} in {source_name}. "
+        "Expected 7-DOF Franka actions or legacy 4-DOF actions."
+    )
+
+
+def franka_action_to_physical_delta(action):
+    """Map a normalized action to the actual per-step delta applied in the env."""
+    action = ensure_franka_action_7d(action)
+    return {
+        "dx_m": float(action[0] * TRANSLATION_STEP_M),
+        "dy_m": float(action[1] * TRANSLATION_STEP_M),
+        "dz_m": float(action[2] * TRANSLATION_STEP_M),
+        "dax_rad": float(action[3] * ROTATION_STEP_RAD),
+        "day_rad": float(action[4] * ROTATION_STEP_RAD),
+        "daz_rad": float(action[5] * ROTATION_STEP_RAD),
+        "gripper_cmd": "close" if action[6] > 0 else "open",
+    }
+
+
+def format_franka_action(action):
+    """
+    Serialize a normalized Franka delta-pose action as a compact supervision target.
+
+    The first 6 dimensions remain normalized to [-1, 1] to match the demos.
+    The gripper is emitted as open/close because the environment uses its sign only.
+    """
+    action = ensure_franka_action_7d(action)
+    gripper_cmd = "close" if action[6] > 0 else "open"
+    values = [f"{key}={action[idx]:+.3f}" for idx, key in enumerate(FRANKA_ACTION_KEYS[:-1])]
+    values.append(f"gripper={gripper_cmd}")
+    return " ".join(values)
+
+
+FRANKA_ACTION_PATTERN = re.compile(
+    r"dx=(?P<dx>[+-]?\d+(?:\.\d+)?)\s+"
+    r"dy=(?P<dy>[+-]?\d+(?:\.\d+)?)\s+"
+    r"dz=(?P<dz>[+-]?\d+(?:\.\d+)?)\s+"
+    r"dax=(?P<dax>[+-]?\d+(?:\.\d+)?)\s+"
+    r"day=(?P<day>[+-]?\d+(?:\.\d+)?)\s+"
+    r"daz=(?P<daz>[+-]?\d+(?:\.\d+)?)\s+"
+    r"gripper=(?P<gripper>open|close)"
+)
+
+
+def parse_franka_action(text):
+    """Parse the generated textual action back into the env's normalized 7-DOF control."""
+    match = FRANKA_ACTION_PATTERN.search(text)
+    if match is None:
+        return None
+    values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
+    values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
+    return ensure_franka_action_7d(values)
+
+
+def format_physical_delta(action):
+    """Human-readable physical interpretation of the normalized action."""
+    delta = franka_action_to_physical_delta(action)
+    return (
+        f"xyz=({delta['dx_m']:+.4f}, {delta['dy_m']:+.4f}, {delta['dz_m']:+.4f}) m/step | "
+        f"rpy=({delta['dax_rad']:+.4f}, {delta['day_rad']:+.4f}, {delta['daz_rad']:+.4f}) rad/step | "
+        f"gripper={delta['gripper_cmd']}"
+    )
+
+
+def format_vla_prompt(instruction):
+    """Describe the exact Franka end-effector control interface expected from the model."""
+    return (
+        f"In: What normalized Franka Panda delta-pose action should the robot take to {instruction}?\n"
+        "Out: Return dx dy dz dax day daz in [-1, 1] and gripper=open|close.\n"
+        f"dx dy dz are Cartesian deltas scaled by {TRANSLATION_STEP_M:.3f} m/step. "
+        f"dax day daz are angular deltas scaled by {ROTATION_STEP_RAD:.2f} rad/step. "
+        "Use gripper=close for positive commands and gripper=open for negative commands.\n"
+        "Action:"
+    )
+
+
+def build_supervised_batch(processor, images, prompts, actions, device, max_length):
+    """
+    Build causal-LM supervision with prompt tokens masked out.
+
+    We serialize the Franka action explicitly so the loss is tied to the 7-DOF
+    delta-pose command instead of only reconstructing the prompt text.
+    """
+    target_texts = [format_franka_action(action) for action in actions.cpu().numpy()]
+    full_texts = [f"{prompt} {target}" for prompt, target in zip(prompts, target_texts)]
+
+    prompt_inputs = processor(
+        images=images,
+        text=prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+    full_inputs = processor(
+        images=images,
+        text=full_texts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+    )
+
+    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+    labels = full_inputs["input_ids"].clone()
+    labels[full_inputs["attention_mask"] == 0] = -100
+    for i, prompt_len in enumerate(prompt_lengths.tolist()):
+        labels[i, :prompt_len] = -100
+
+    full_inputs = full_inputs.to(device)
+    full_inputs["labels"] = labels.to(device)
+    return full_inputs, target_texts
+
+
+def save_franka_action_metadata(save_dir):
+    """Persist the action semantics alongside the fine-tuned adapter."""
+    os.makedirs(save_dir, exist_ok=True)
+    metadata = {
+        "control_mode": "franka_delta_pose",
+        "action_order": list(FRANKA_ACTION_KEYS),
+        "normalized_range": [ACTION_MIN, ACTION_MAX],
+        "translation_step_m": TRANSLATION_STEP_M,
+        "rotation_step_rad": ROTATION_STEP_RAD,
+        "gripper_semantics": {
+            "negative": "open",
+            "positive": "close",
+        },
+        "target_format": "dx=... dy=... dz=... dax=... day=... daz=... gripper=open|close",
+    }
+    with open(os.path.join(save_dir, "franka_action_config.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+
 # ═══════════════════════════════════════════════════════════════
 # Cell 3: Custom Dataset
 # ═══════════════════════════════════════════════════════════════
@@ -91,11 +248,13 @@ class VLADemoDataset(Dataset):
     Each sample returns:
     - image: PIL Image (will be processed by VLA processor)
     - instruction: str
-    - action: (7,) float tensor (padded to 7-DOF for OpenVLA)
+    - action: (7,) float tensor for Franka end-effector control
 
-    OpenVLA expects 7-DOF actions: [dx, dy, dz, dax, day, daz, gripper]
-    Our demos have 4-DOF: [dx, dy, dz, gripper]
-    We pad rotation dims with zeros.
+    Franka demos store 7-DOF actions:
+    [dx, dy, dz, dax, day, daz, gripper]
+
+    Legacy 4-DOF demos are still supported and get padded to 7-DOF:
+    [dx, dy, dz, 0, 0, 0, gripper]
     """
 
     def __init__(self, demo_dir, image_size=224, augment=True):
@@ -116,10 +275,11 @@ class VLADemoDataset(Dataset):
                 instructions = data["instructions"]
 
                 for t in range(len(actions)):
+                    action_7d = ensure_franka_action_7d(actions[t], source_name=f)
                     self.samples.append({
                         "image": images[t],               # (H, W, 3) uint8
                         "instruction": str(instructions[t]),  # str
-                        "action_4d": actions[t],          # (4,) float
+                        "action_7d": action_7d,           # (7,) float
                         "source": "mujoco",
                     })
             print(f"  Loaded {len(self.samples)} samples from {len(demo_files)} self-collected demos")
@@ -158,15 +318,20 @@ class VLADemoDataset(Dataset):
             img = img.crop((left, top, left + crop_size, top + crop_size))
             img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
 
-        # Pad 4-DOF to 7-DOF: [dx, dy, dz, 0, 0, 0, gripper]
-        a4 = sample["action_4d"]
-        action_7d = np.array([a4[0], a4[1], a4[2], 0.0, 0.0, 0.0, a4[3]], dtype=np.float32)
-
         return {
             "image": img,
             "instruction": sample["instruction"],
-            "action": torch.tensor(action_7d),
+            "action": torch.tensor(sample["action_7d"], dtype=torch.float32),
         }
+
+
+def collate_vla_batch(batch):
+    """Keep PIL images as a Python list; default_collate cannot stack them."""
+    return {
+        "image": [sample["image"] for sample in batch],
+        "instruction": [sample["instruction"] for sample in batch],
+        "action": torch.stack([sample["action"] for sample in batch]),
+    }
 
 
 # Test dataset
@@ -176,7 +341,9 @@ if len(dataset) > 0:
     sample = dataset[0]
     print(f"  Sample image: {sample['image'].size}")
     print(f"  Sample instruction: '{sample['instruction']}'")
-    print(f"  Sample action: {sample['action']}")
+    print(f"  Sample action (normalized): {sample['action']}")
+    print(f"  Sample action (serialized): {format_franka_action(sample['action'].numpy())}")
+    print(f"  Sample action (physical): {format_physical_delta(sample['action'].numpy())}")
 else:
     print("⚠️ No data loaded! Check DEMO_DIR or LIBERO fetching.")
 
@@ -269,30 +436,10 @@ dataloader = DataLoader(
     num_workers=2,
     pin_memory=True,
     drop_last=True,
+    collate_fn=collate_vla_batch,
 )
 
 scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS * len(dataloader))
-
-# Action tokenization helper
-# OpenVLA uses 256 discrete bins per action dimension
-ACTION_BINS = 256
-ACTION_MIN = -1.0
-ACTION_MAX = 1.0
-
-def discretize_actions(actions, n_bins=ACTION_BINS):
-    """Convert continuous actions to discrete token ids."""
-    # Clip to range
-    actions = torch.clamp(actions, ACTION_MIN, ACTION_MAX)
-    # Normalize to [0, 1]
-    normalized = (actions - ACTION_MIN) / (ACTION_MAX - ACTION_MIN)
-    # Convert to bin indices
-    bin_ids = (normalized * (n_bins - 1)).long()
-    return bin_ids
-
-def format_vla_prompt(instruction):
-    """Format instruction as VLA prompt."""
-    return f"In: What action should the robot take to {instruction}?\nOut:"
-
 
 print(f"\n{'='*60}")
 print(f"Starting QLoRA Fine-Tuning")
@@ -318,23 +465,18 @@ for epoch in range(NUM_EPOCHS):
         # Format prompts
         prompts = [format_vla_prompt(inst) for inst in instructions]
 
-        # Process through OpenVLA processor
-        inputs = processor(
-            images=images,
-            text=prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-        ).to(model.device)
+        # Build prompt + structured Franka action targets with prompt masking
+        inputs, target_texts = build_supervised_batch(
+            processor,
+            images,
+            prompts,
+            actions,
+            model.device,
+            MAX_SEQ_LEN,
+        )
 
-        # Discretize action targets
-        action_tokens = discretize_actions(actions)  # (B, 7)
-
-        # Forward pass
-        # Note: OpenVLA internally handles action token prediction
-        # For custom training, we use the language model loss
-        outputs = model(**inputs, labels=inputs["input_ids"])
+        # Forward pass on the structured delta-pose target
+        outputs = model(**inputs)
         loss = outputs.loss / GRAD_ACCUM_STEPS
 
         loss.backward()
@@ -351,11 +493,13 @@ for epoch in range(NUM_EPOCHS):
                       f"Step {global_step} | "
                       f"Loss: {loss.item() * GRAD_ACCUM_STEPS:.4f} | "
                       f"LR: {scheduler.get_last_lr()[0]:.2e}")
+                print(f"    Target format: {target_texts[0]}")
 
             # Save checkpoint
             if global_step % SAVE_STEPS == 0:
                 ckpt_path = os.path.join(OUTPUT_DIR, f"checkpoint-{global_step}")
                 model.save_pretrained(ckpt_path)
+                save_franka_action_metadata(ckpt_path)
                 print(f"  💾 Saved checkpoint: {ckpt_path}")
 
         epoch_loss += loss.item() * GRAD_ACCUM_STEPS
@@ -368,6 +512,7 @@ for epoch in range(NUM_EPOCHS):
         best_loss = avg_loss
         best_path = os.path.join(OUTPUT_DIR, "best")
         model.save_pretrained(best_path)
+        save_franka_action_metadata(best_path)
         print(f"  ⭐ New best model saved: {best_path}")
 
 # ═══════════════════════════════════════════════════════════════
@@ -377,11 +522,13 @@ for epoch in range(NUM_EPOCHS):
 final_path = os.path.join(OUTPUT_DIR, "final")
 model.save_pretrained(final_path)
 processor.save_pretrained(final_path)
+save_franka_action_metadata(final_path)
 
 print(f"\n{'='*60}")
 print(f"✅ Training complete!")
 print(f"   Best loss: {best_loss:.4f}")
 print(f"   Model saved: {final_path}")
+print(f"   Franka action spec: {os.path.join(final_path, 'franka_action_config.json')}")
 print(f"   Download the 'openvla-finetuned' folder for Notebook 3")
 print(f"{'='*60}")
 
@@ -404,13 +551,23 @@ inputs = processor(
 with torch.no_grad():
     generated = model.generate(
         **inputs,
-        max_new_tokens=7,  # 7 action dimensions
+        max_new_tokens=48,
         do_sample=False,
     )
-    # Decode action tokens
-    action_text = processor.batch_decode(generated[:, inputs["input_ids"].shape[1]:])
+    generated_text = processor.batch_decode(
+        generated[:, inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )[0]
+
+parsed_action = parse_franka_action(generated_text)
 
 print(f"\n🔎 Inference test:")
 print(f"   Instruction: '{test_instruction}'")
-print(f"   Generated: {action_text}")
+print(f"   Generated text: {generated_text}")
+print(f"   Ground-truth target: {format_franka_action(dataset[0]['action'].numpy())}")
+if parsed_action is not None:
+    print(f"   Parsed action (normalized): {parsed_action}")
+    print(f"   Parsed action (physical): {format_physical_delta(parsed_action)}")
+else:
+    print("   Parsed action: <failed to match Franka delta-pose format>")
 print(f"\n📋 Next: Run Notebook 3 for flow-matching training + evaluation")
