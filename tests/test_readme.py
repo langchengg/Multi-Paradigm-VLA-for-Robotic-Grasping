@@ -9,6 +9,7 @@ def test_readme_prioritizes_run_order_and_real_outputs():
 
     assert "## ✅ Recommended Run Order" in source
     assert "python scripts/run_demo.py --quick" in source
+    assert "python scripts/run_kaggle_pipeline.py" in source
     assert "notebooks/01_env_setup_and_demo.py" in source
     assert "notebooks/02_openvla_qlora_finetune.py" in source
     assert "notebooks/03_flow_matching_eval.py" in source

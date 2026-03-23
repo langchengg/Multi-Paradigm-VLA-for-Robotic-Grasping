@@ -51,13 +51,25 @@ python scripts/run_demo.py --quick
 
 ### B. Full Kaggle Pipeline
 
-Use this fixed order:
+Recommended: run the whole chain in one Kaggle session:
+
+```bash
+python scripts/run_kaggle_pipeline.py
+```
+
+This single entry point runs Notebook 1 → Notebook 2 → Notebook 3 in order and reuses:
+
+- `/kaggle/working/demos`
+- `/kaggle/working/openvla-finetuned/final`
+- `/kaggle/working/results`
+
+Manual split mode is still supported. Use this fixed order if you want separate Kaggle notebooks:
 
 1. `notebooks/01_env_setup_and_demo.py`
 2. `notebooks/02_openvla_qlora_finetune.py`
 3. `notebooks/03_flow_matching_eval.py`
 
-If `Notebook 1` and `Notebook 2` are not run in the same Kaggle session, upload `/kaggle/working/demos/` as a Dataset first, then mount it in `Notebook 2`.
+Only if you break the workflow across different Kaggle sessions do you need to publish `/kaggle/working/demos/` or `/kaggle/working/openvla-finetuned/` as Datasets.
 
 ---
 
@@ -310,7 +322,13 @@ Expected:
 
 ### Step 5: Train on Kaggle T4 GPU
 
-Upload the files to Kaggle and run the 3 notebooks in order:
+Simplest option: upload the repo to Kaggle, enable `Internet`, attach a `T4 GPU`, and run:
+
+```bash
+python scripts/run_kaggle_pipeline.py
+```
+
+If you prefer separate notebooks, run the 3 notebook scripts in order:
 
 | Step | Notebook | Time | GPU |
 |------|----------|------|-----|
@@ -318,7 +336,7 @@ Upload the files to Kaggle and run the 3 notebooks in order:
 | 5b | `notebooks/02_openvla_qlora_finetune.py` | ~1-3 hrs | T4 required |
 | 5c | `notebooks/03_flow_matching_eval.py` | ~45-90 min | T4 required |
 
-**Notebook 1** → Collects 100 expert demos in MuJoCo → upload as a Kaggle Dataset  
+**Notebook 1** → Collects 100 expert demos in MuJoCo into `/kaggle/working/demos`  
 **Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA on MuJoCo demos + DROID real-robot data  
 **Notebook 3** → Trains lightweight FlowMatching/Diffusion VLAs + held-out DROID offline eval
 
@@ -363,7 +381,8 @@ ls -lh assets_quick.zip
 │   ├── 02_openvla_qlora_finetune.py # Kaggle: OpenVLA-7B QLoRA fine-tuning on T4
 │   └── 03_flow_matching_eval.py    # Kaggle: DROID offline train/eval comparison
 ├── scripts/
-│   └── run_demo.py                 # One-click: full pipeline in ~15 seconds
+│   ├── run_demo.py                 # One-click local quick pipeline in ~15 seconds
+│   └── run_kaggle_pipeline.py      # One-click Kaggle 1→2→3 orchestration
 ├── tests/
 │   ├── test_env.py                 # Unit tests (20/20 passing)
 │   └── test_rendering.py           # Headless rendering tests
