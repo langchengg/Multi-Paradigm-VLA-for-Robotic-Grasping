@@ -1,7 +1,7 @@
 # VLA Action Decoder Benchmark: Autoregressive vs Diffusion vs Flow-Matching 🦾
 
 > **Which action decoder is best for VLA robotic manipulation?**
-> This project systematically compares 3 paradigms — using a Franka Panda in MuJoCo.
+> This project systematically compares 3 paradigms using a Franka Panda in MuJoCo.
 
 [![Python 3.12](https://img.shields.io/badge/Python-3.12-blue.svg)](https://www.python.org/)
 [![MuJoCo](https://img.shields.io/badge/MuJoCo-3.5-green.svg)](https://mujoco.org/)
@@ -11,33 +11,33 @@
 
 ## 🎯 Core Research Question
 
-VLA models (Vision-Language-Action) take in camera images + language instructions and output robot actions. **But HOW should the model generate those actions?** Nobody knows which method is best. This project benchmarks all three:
+VLA models (Vision-Language-Action) take in camera images + language instructions and output robot actions. **But how should the model generate those actions?** Nobody knows which method is best. This project benchmarks all three:
 
-```
-核心问题: VLA "大脑" 想好了要干什么之后，怎么把想法变成具体的手臂动作？
+```text
+Core question: after the VLA "brain" decides what to do, how should it turn that intent into concrete robot arm actions?
 
-方法A: 自回归 (Autoregressive)  ── OpenVLA 用的
-方法B: 扩散   (Diffusion)       ── Diffusion Policy 用的
-方法C: 流匹配 (Flow-Matching)   ── Physical Intelligence π0 用的
+Method A: Autoregressive   — used by OpenVLA
+Method B: Diffusion        — used by Diffusion Policy
+Method C: Flow-Matching    — used by Physical Intelligence π0
 ```
 
 ## ✅ Recommended Run Order
 
-### A. 本地快速自检
+### A. Local Quick Sanity Check
 
 ```bash
-# 1) 安装 Python 依赖
+# 1) Install Python dependencies
 pip install -r requirements.txt
 
-# 2) Headless Linux / Kaggle 需要的 OpenGL 依赖
+# 2) OpenGL dependencies needed for headless Linux / Kaggle
 apt-get update -qq && apt-get install -y -qq \
   libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev \
   libosmesa6-dev libglew-dev patchelf
 
-# 3) 验证 Franka Panda 环境
+# 3) Verify the Franka Panda environment
 python -m envs.franka_grasp_env
 
-# 4) 跑关键测试
+# 4) Run the key tests
 python -m pytest -q \
   tests/test_env.py \
   tests/test_rendering.py \
@@ -45,105 +45,107 @@ python -m pytest -q \
   tests/test_openvla_notebook.py \
   tests/test_flow_matching_head.py
 
-# 5) 跑本地 quick pipeline
+# 5) Run the local quick pipeline
 python scripts/run_demo.py --quick
 ```
 
-### B. Kaggle 完整链路
+### B. Full Kaggle Pipeline
 
-固定顺序：
+Use this fixed order:
 
 1. `notebooks/01_env_setup_and_demo.py`
 2. `notebooks/02_openvla_qlora_finetune.py`
 3. `notebooks/03_flow_matching_eval.py`
 
-如果 `Notebook 1` 和 `Notebook 2` 不在同一个 Kaggle session 里运行，需要先把 `/kaggle/working/demos/` 上传成 Dataset，再挂载给 `Notebook 2`。
+If `Notebook 1` and `Notebook 2` are not run in the same Kaggle session, upload `/kaggle/working/demos/` as a Dataset first, then mount it in `Notebook 2`.
 
 ---
 
 ## 🧠 Three Action Decoders Explained
 
-### Method A: Autoregressive (像 ChatGPT 一样一个一个蹦)
+### Method A: Autoregressive (like ChatGPT, one token at a time)
 
+```text
+Just like ChatGPT generates text:
+  "I" → "feel" → "very" → "happy"
+
+OpenVLA generates actions in the same way:
+  first decide the x delta → then y → then z → ... → finally the gripper
+
+How it works: continuous actions are discretized into 256 bins
+  the x value lies in [-1, +1]
+  0.03 → maps to bin 131 → output token "131"
+
+So the action becomes: "131, 122, 89, 128, 128, 128, 1"
+                      x    y    z   rx   ry   rz  gripper
+
+At its core, this turns action generation into a classification problem:
+pick one bin out of 256.
 ```
-就像 ChatGPT 生成文字:  "我" → "今" → "天" → "很" → "开" → "心"
 
-OpenVLA 生成动作也一样:
-  先决定 x方向移多少 → 再决定 y方向 → 再决定 z方向 → ... → 最后决定夹爪
-
-具体做法: 把连续的动作值切成 256 个格子 (像把尺子分成 256 份)
-  x 方向的值在 [-1, +1] 之间
-  0.03 → 对应第 131 号格子 → 输出 token "131"
-
-  所以输出动作变成了: "131, 122, 89, 128, 128, 128, 1"
-                       x    y    z   rx   ry   rz  夹爪
-
-  ⚡ 本质上是个"分类问题"，在 256 个格子里选一个
-```
-
-**优点**: 简单、成熟 (OpenVLA 就是这样做的)  
-**缺点**: 精度受限 (只有 256 格)、慢 (7 个数字 = 7 次前向计算)、维度独立预测
+**Advantages**: simple, mature, already used by OpenVLA  
+**Drawbacks**: limited precision (only 256 bins), slower (7 numbers = 7 forward passes), dimensions are predicted independently
 
 ---
 
-### Method B: Diffusion (从一团噪声里"雕刻"出动作)
+### Method B: Diffusion (sculpting an action out of noise)
 
+```text
+Like image generation in Stable Diffusion:
+  noisy image → progressively denoise → sharp image
+
+Action generation works the same way:
+  random noise        [0.83, -0.45, 0.12, ...]  (messy numbers)
+  ↓ denoise step 1    [0.52, -0.23, 0.08, ...]
+  ↓ denoise step 2    [0.31, -0.10, 0.01, ...]
+  ↓ ... repeat 50-100 steps ...
+  ↓ final denoise     [0.03, -0.01, -0.05, 0, 0, 0, 1]  ← final action
 ```
-就像图像生成 (Stable Diffusion):
-  全是噪点的图 → 逐步去噪 → 清晰图片
 
-生成动作也一样:
-  随机噪声       [0.83, -0.45, 0.12, ...]  (乱七八糟的数字)
-  ↓ 去噪第 1 步  [0.52, -0.23, 0.08, ...]
-  ↓ 去噪第 2 步  [0.31, -0.10, 0.01, ...]
-  ↓ ... 重复 50-100 步 ...
-  ↓ 去噪最后一步 [0.03, -0.01, -0.05, 0, 0, 0, 1]  ← 最终动作！
-```
-
-**优点**: 连续空间、精度无限、能处理"多种到达方式"  
-**缺点**: 去噪步数多，推理慢 (50-100 步)
+**Advantages**: continuous action space, effectively unlimited precision, can represent multiple valid ways to solve the task  
+**Drawbacks**: many denoising steps, slow inference (50-100 steps)
 
 ---
 
-### Method C: Flow-Matching (画一条直线从噪声走到动作)
+### Method C: Flow-Matching (draw a straight line from noise to action)
 
+```text
+Diffusion models take a curved path:
+  noise  ~~~curved path~~~>  action   (many steps)
+
+Flow-matching takes a straight path:
+  noise  ——straight line——>  action   (only 5-10 steps! 🚀)
+
+How it works: train a network to predict a velocity field
+  t=0.0:  pure noise    [0.83, -0.45, ...]
+  t=0.5:  halfway there [0.43, -0.23, ...]  (velocity field points the direction)
+  t=1.0:  target action [0.03, -0.01, ...]  (final action)
+
+Physical Intelligence's π0 uses this paradigm.
 ```
-扩散模型走的是弯弯曲曲的路:
-  噪声  ~~~曲线~~~>  动作   (需要很多步)
 
-流匹配走的是直线:
-  噪声  ——直线——>  动作   (只需要 5-10 步! 🚀)
-
-具体做法: 训练一个网络预测"速度场"
-  t=0.0:  纯噪声  [0.83, -0.45, ...]
-  t=0.5:  走到一半 [0.43, -0.23, ...]  (速度场指引方向)
-  t=1.0:  到达目标 [0.03, -0.01, ...]  (最终动作)
-
-  Physical Intelligence 的 π0 就用的这个方法
-```
-
-**优点**: 连续空间 + 快 5-10× (直线 vs 曲线)  
-**缺点**: 需要调参、对噪声调度敏感
+**Advantages**: continuous space + 5-10× faster than diffusion (straight path vs curved path)  
+**Drawbacks**: requires tuning and can be sensitive to the noise schedule
 
 ---
 
-### 三种方法可视化对比
+### Visual Comparison of the Three Methods
 
-```
-方法A 自回归:  [图像+文字] → 格子131 → 格子122 → 格子89 → ... (一个个选)
-方法B 扩散:    [图像+文字] → 噪声 ~~~> ~~> ~~> ~~> 动作      (慢慢去噪)
-方法C 流匹配:  [图像+文字] → 噪声 ——————————> 动作            (直线到达 🚀)
+```text
+Method A Autoregressive:  [image + text] → bin131 → bin122 → bin89 → ... (choose one by one)
+Method B Diffusion:       [image + text] → noise ~~~> ~~> ~~> ~~> action  (gradual denoising)
+Method C Flow-Matching:   [image + text] → noise ——————————> action        (straight path 🚀)
 ```
 
 ---
 
 ## 📦 Outputs After Running
 
-README 首页不再展示仓库里预置的 demo GIF，而是展示你跑完后会实际得到什么。
+The README home page no longer shows pre-baked demo GIFs from the repo. Instead, it shows what you will actually get after running the project yourself.
 
-### 本地运行 `python scripts/run_demo.py --quick`
+### Local Run: `python scripts/run_demo.py --quick`
 
-会生成这些结果：
+This generates:
 
 ```text
 assets/
@@ -168,7 +170,7 @@ data/demos/
 assets_quick.zip
 ```
 
-终端还会打印每个 decoder 的闭环结果摘要：
+The terminal will also print a closed-loop summary for each decoder:
 
 ```text
 autoregressive: success=..., latency=...ms
@@ -176,9 +178,9 @@ diffusion:      success=..., latency=...ms
 flow_matching:  success=..., latency=...ms
 ```
 
-### Kaggle 跑完 3 个 Notebook
+### After Finishing All 3 Kaggle Notebooks
 
-你会在 `/kaggle/working/` 拿到：
+You will have these outputs under `/kaggle/working/`:
 
 1. `demos/demo_*.npz`
 2. `expert_demo.gif`
@@ -201,27 +203,27 @@ flow_matching:  success=..., latency=...ms
 
 ## 🏗️ System Architecture
 
-```
+```text
 ┌─────────── Training Pipeline ───────────┐    ┌──── Closed-Loop Eval ────┐
 │                                          │    │                          │
 │ [MuJoCo Franka Panda]                    │    │  Camera 📷 → Image      │
 │       │                                  │    │       ↓                  │
 │  Scripted Expert Policy                  │    │  VLA Model 🧠           │
-│       │                                  │    │  (3 decoders 比较)       │
+│       │                                  │    │  (3 decoders compared)  │
 │  100 Expert Demos                        │    │       ↓                  │
 │  (image + instruction + action)          │    │  Action → Franka Panda  │
 │       │                                  │    │       ↓                  │
 │  ┌────┴────────────────┐                 │    │  Physics Step → Repeat  │
-│  │ Decoder A: 自回归    │ ← OpenVLA      │    │       ↓                  │
-│  │ Decoder B: 扩散      │ ← Diffusion    │    │  Success? → 📊 Metrics  │
-│  │ Decoder C: 流匹配    │ ← π0           │    │            → 🎬 GIF     │
+│  │ Decoder A: AR        │ ← OpenVLA      │    │       ↓                  │
+│  │ Decoder B: Diffusion │ ← Diffusion    │    │  Success? → 📊 Metrics  │
+│  │ Decoder C: Flow      │ ← π0           │    │            → 🎬 GIF     │
 │  └─────────────────────┘                 │    │            → 📈 Plots   │
 └──────────────────────────────────────────┘    └──────────────────────────┘
 ```
 
 ---
 
-## 🚀 From-Zero Setup (一步步来)
+## 🚀 From-Zero Setup (step by step)
 
 ### Step 0: Clone and Install
 
@@ -242,12 +244,13 @@ apt-get update -qq && apt-get install -y -qq \
 ### Step 1: Verify Environment (10 seconds)
 
 ```bash
-# Test the Franka Panda environment loads correctly
+# Test that the Franka Panda environment loads correctly
 python -m envs.franka_grasp_env
 ```
 
 You should see:
-```
+
+```text
 [FrankaGraspEnv] image=256x256, camera=frontview
   7-DOF Franka Panda + parallel gripper
   Objects: ['red_cube', 'blue_cube', 'green_cube']
@@ -270,10 +273,11 @@ python scripts/run_demo.py --quick
 ```
 
 This does everything:
-1. Creates MuJoCo env with Franka Panda + 3 colored cubes
-2. Collects expert demos with scripted grasping policy
+
+1. Creates a MuJoCo env with a Franka Panda + 3 colored cubes
+2. Collects expert demos with a scripted grasping policy
 3. Evaluates **all 3 decoders** (autoregressive, diffusion, flow-matching)
-4. Generates GIFs, trajectory plots, and comparison charts → `assets/`
+4. Generates GIFs, trajectory plots, and comparison charts into `assets/`
 
 ### Step 4: Test Flow-Matching Decoder
 
@@ -283,7 +287,8 @@ python models/flow_matching_head.py
 ```
 
 Expected:
-```
+
+```text
 ✅ Flow loss: ~1.83
 ✅ Predicted actions: torch.Size([4, 4, 7])   # (batch, horizon, action_dim)
    FlowMatchingHead params: 0.40M
@@ -295,7 +300,8 @@ python models/diffusion_head.py
 ```
 
 Expected:
-```
+
+```text
 ✅ Diffusion loss: ~1.00
 ✅ Predicted actions: torch.Size([4, 4, 7])   # (batch, horizon, action_dim)
    DiffusionHead params: ~0.40M
@@ -303,7 +309,7 @@ Expected:
 
 ### Step 5: Train on Kaggle T4 GPU
 
-Upload files to Kaggle and run the 3 notebooks in order:
+Upload the files to Kaggle and run the 3 notebooks in order:
 
 | Step | Notebook | Time | GPU |
 |------|----------|------|-----|
@@ -311,11 +317,11 @@ Upload files to Kaggle and run the 3 notebooks in order:
 | 5b | `notebooks/02_openvla_qlora_finetune.py` | ~1-2 hrs | T4 required |
 | 5c | `notebooks/03_flow_matching_eval.py` | ~40 min | T4 required |
 
-**Notebook 1** → Collects 100 expert demos in MuJoCo → Upload as Kaggle Dataset  
+**Notebook 1** → Collects 100 expert demos in MuJoCo → upload as a Kaggle Dataset  
 **Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA (4-bit quantization, LoRA rank=32)  
-**Notebook 3** → Trains lightweight FlowMatchingVLA (117M params) + closed-loop eval → GIFs
+**Notebook 3** → Trains a lightweight FlowMatchingVLA (117M params) + closed-loop eval → GIFs
 
-If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The Notebook 2 and 3 install cells do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.
+If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The install cells in Notebook 2 and 3 do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.
 Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 1000 real samples from [`physical-intelligence/libero`](https://huggingface.co/datasets/physical-intelligence/libero) using its official task map [`meta/tasks.jsonl`](https://huggingface.co/datasets/physical-intelligence/libero/blob/main/meta/tasks.jsonl). The default Kaggle-fast preset also runs for 1 epoch. If neither source yields data, it fails immediately instead of pretending LIBERO was loaded.
 
 ### Step 6: View Results
@@ -333,7 +339,7 @@ ls -lh assets_quick.zip
 
 ## 📁 Project Structure
 
-```
+```text
 ├── envs/
 │   ├── franka_grasp_env.py         # 🦾 Franka Panda 7-DOF + parallel gripper (primary)
 │   ├── simple_grasp_env.py         # Simplified 3-DOF gripper (for quick tests)
@@ -372,7 +378,7 @@ ls -lh assets_quick.zip
 - **Parallel gripper** with 2 fingers and finger pads
 - **7-DOF action space**: `[dx, dy, dz, dax, day, daz, gripper]` — Cartesian + orientation control
 - **Backward compatible**: also accepts 4-DOF `[dx, dy, dz, gripper]` (rotation auto-padded to 0)
-- **Jacobian-based IK**: Resolved-rate inverse kinematics (damped least-squares) converts Cartesian + angular velocity to 7-DOF joint commands using both position and rotation Jacobians
+- **Jacobian-based IK**: resolved-rate inverse kinematics (damped least-squares) converts Cartesian + angular velocity to 7-DOF joint commands using both position and rotation Jacobians
 - **3 colored objects** (red, blue, green cubes) with randomized positions
 - **12 language instructions** across 3 objects
 - **3 camera views** (front, top-down, side) at 256×256
@@ -382,17 +388,18 @@ ls -lh assets_quick.zip
 ```python
 # Training
 t = sample_beta(α=1.5, β=1.0)                    # Shifted beta time schedule
-x_t = (1-t) * noise + t * action_gt               # Linear interpolation
-loss = MSE(velocity_net(x_t, t, features),         # Predict velocity field
-           action_gt - noise)                      # Target: optimal transport direction
+x_t = (1-t) * noise + t * action_gt              # Linear interpolation
+loss = MSE(velocity_net(x_t, t, features),       # Predict velocity field
+           action_gt - noise)                    # Target: optimal transport direction
 
 # Inference (only 10 ODE steps — 5× faster than diffusion)
-x = randn(batch, horizon * action_dim)             # Start from noise
+x = randn(batch, horizon * action_dim)           # Start from noise
 for i in range(10):
-    x += velocity_net(x, t=i/10, features) * dt    # Euler integration
+    x += velocity_net(x, t=i/10, features) * dt  # Euler integration
 ```
 
 Key choices:
+
 - **Shifted beta distribution** for time sampling (π0 recipe)
 - **Action chunking** H=4 (predict 4 future actions at once)
 - **Sinusoidal time embeddings** (same as diffusion models)
@@ -402,20 +409,21 @@ Key choices:
 
 ```python
 # Training (DDPM)
-t = randint(0, T)                                   # Random timestep
-noise = randn_like(action)                           # Sample noise
-x_t = sqrt(ā_t) * action_gt + sqrt(1-ā_t) * noise   # Forward diffusion
-loss = MSE(noise_net(x_t, t, features), noise)       # Predict noise
+t = randint(0, T)                                 # Random timestep
+noise = randn_like(action)                        # Sample noise
+x_t = sqrt(ā_t) * action_gt + sqrt(1-ā_t) * noise # Forward diffusion
+loss = MSE(noise_net(x_t, t, features), noise)    # Predict noise
 
 # Inference (DDIM, 10 steps — deterministic, no stochastic noise)
-x = randn(batch, horizon * action_dim)               # Start from noise
-for t in reversed(ddim_timesteps):                   # 10 evenly-spaced steps
+x = randn(batch, horizon * action_dim)            # Start from noise
+for t in reversed(ddim_timesteps):                # 10 evenly-spaced steps
     pred_noise = noise_net(x, t, features)
     pred_x0 = (x - sqrt(1-ā_t)*pred_noise) / sqrt(ā_t)
     x = sqrt(ā_{t-1}) * pred_x0 + sqrt(1-ā_{t-1}) * pred_noise
 ```
 
 Key choices:
+
 - **Cosine noise schedule** (improved DDPM, Nichol & Dhariwal 2021)
 - **DDIM deterministic sampling** for faster inference (10 steps vs 50-100)
 - **Action chunking** H=4 (same as flow-matching)
@@ -423,7 +431,7 @@ Key choices:
 
 ### OpenVLA QLoRA Setup (Notebook 2)
 
-```
+```text
 OpenVLA-7B (7 billion params)
   ↓ 4-bit NF4 quantization (bitsandbytes)
   ↓ LoRA adapters (rank=32, α=64)
@@ -434,30 +442,18 @@ OpenVLA-7B (7 billion params)
 
 ### Closed-Loop Evaluation Pipeline
 
-```
+```text
 For each episode (50 episodes per decoder):
-  1. Reset env: Franka Panda at home config, randomize object positions
-  2. Select target object + language instruction
+  1. Reset the env: Franka Panda at home config, randomize object positions
+  2. Select a target object + language instruction
   3. Loop (max 150 steps):
-     a. Camera renders 256×256 RGB image
+     a. Camera renders a 256×256 RGB image
      b. VLA model: image + instruction → action [dx,dy,dz,dax,day,daz,gripper]
      c. Jacobian IK: delta-pose action → 7-DOF joint commands
-     d. MuJoCo physics simulation (20 substeps)
-     e. Check: object lifted above 0.35m? → Success!
-  4. Record: success/failure, trajectory, frames → GIF
+     d. MuJoCo physics simulation (60 substeps)
+     e. Check: object lifted above 0.35 m? → success
+  4. Record success/failure, trajectory, and frames → GIF
 ```
-
----
-
-## 📈 Analysis & Insights
-
-### Trajectory Comparison
-![trajectories](assets/trajectories_3d.png)
-
-### Success Rate by Position
-![heatmap](assets/success_heatmap.png)
-
-**Key insight**: Success degrades near workspace boundaries → need workspace-aware training augmentation.
 
 ---
 
@@ -475,12 +471,12 @@ For each episode (50 episodes per decoder):
 
 ## 📄 References
 
-- [OpenVLA: An Open-Source Vision-Language-Action Model](https://openvla.github.io/) — Autoregressive baseline
-- [π0: A Vision-Language-Action Flow Model](https://www.physicalintelligence.company/blog/pi0) — Flow-matching inspiration
-- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) — Diffusion baseline
-- [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747) — Mathematical foundation
+- [OpenVLA: An Open-Source Vision-Language-Action Model](https://openvla.github.io/) — autoregressive baseline
+- [π0: A Vision-Language-Action Flow Model](https://www.physicalintelligence.company/blog/pi0) — flow-matching inspiration
+- [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) — diffusion baseline
+- [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747) — mathematical foundation
 - [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) — Franka Panda model reference
 
 ---
 
-*Built as a portfolio project demonstrating systematic comparison of VLA action decoders for robotic manipulation. Complete pipeline — custom Franka Panda environment, 3 decoder implementations, closed-loop evaluation, Kaggle T4 training — runs from zero with the commands above.*
+*Built as a portfolio project demonstrating a systematic comparison of VLA action decoders for robotic manipulation. The full pipeline — custom Franka Panda environment, 3 decoder implementations, closed-loop evaluation, and Kaggle T4 training — runs from zero with the commands above.*
