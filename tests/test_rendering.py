@@ -266,16 +266,21 @@ def test_envs_package_is_lazy(monkeypatch):
     assert "envs.simple_grasp_env" in sys.modules
 
 
-def test_flow_matching_notebook_uses_shared_env_module():
+def test_flow_matching_notebook_uses_real_data_offline_eval_path():
     notebook_path = (
         Path(__file__).resolve().parents[1] / "notebooks" / "03_flow_matching_eval.py"
     )
     source = notebook_path.read_text()
 
     assert "notebooks.simplified_env" not in source
-    assert "from envs.franka_grasp_env import FrankaGraspEnv" in source
-    assert "VLAMuJoCoEvaluator" in source
-    assert "configure_headless_rendering()" in source
+    assert "DROID_DATASET_REPO_CANDIDATES" in source
+    assert "load_real_droid_records" in source
+    assert "OfflineRealDataEvaluator" in source
+    assert "from data.droid_utils import (" in source
+    assert "from models.flow_matching_head import FlowMatchingHead" in source
+    assert "FrankaGraspEnv" not in source
+    assert "VLAMuJoCoEvaluator" not in source
+    assert "configure_headless_rendering()" not in source
     assert 'os.environ["MUJOCO_GL"] = "osmesa"' not in source
 
 

@@ -20,20 +20,34 @@ def test_openvla_notebook_pins_compatible_transformers_stack():
     assert '"--upgrade"' in source
 
 
-def test_openvla_notebook_loads_real_data_instead_of_simulating_libero():
+def test_openvla_notebook_loads_real_data_from_droid():
     notebook_path = (
         Path(__file__).resolve().parents[1] / "notebooks" / "02_openvla_qlora_finetune.py"
     )
     source = notebook_path.read_text()
 
-    assert 'LIBERO_DATASET_REPO = "physical-intelligence/libero"' in source
-    assert "LIBERO_MAX_SAMPLES = 1000" in source
+    assert 'USE_DROID = True' in source
+    assert 'DROID_DATASET_REPO = "cadene/droid_1.0.1_v30"' in source
+    assert "DROID_MAX_SAMPLES = 1000" in source
+    assert "DROID_FPS = DROID_DEFAULT_FPS" in source
     assert "NUM_EPOCHS = 1" in source
+    assert "from data.droid_utils import (" in source
     assert "def resolve_demo_dir(preferred_dir):" in source
     assert 'load_dataset(' in source
     assert 'streaming=True' in source
-    assert 'load_libero_task_lookup(LIBERO_DATASET_REPO)' in source
+    assert "load_droid_task_lookup," in source
+    assert "droid_cartesian_velocity_to_franka_action," in source
+    assert "droid_action_to_franka_action," in source
+    assert 'raw_action = sample_get(sample, "action.original", "action")' in source
+    assert 'cartesian_velocity = sample_get(sample, "action.cartesian_velocity")' in source
+    assert 'gripper_position = sample_get(sample, "action.gripper_position")' in source
+    assert 'gripper_velocity = sample_get(sample, "action.gripper_velocity")' in source
+    assert 'dataset = VLADemoDataset(DEMO_DIR, image_size=IMAGE_SIZE, use_droid=USE_DROID)' in source
+    assert "def load_droid_task_lookup(repo_id):" not in source
+    assert "def droid_cartesian_velocity_to_franka_action(" not in source
+    assert "def droid_action_to_franka_action(action, source_name=" not in source
     assert 'Simulated loading' not in source
+    assert 'physical-intelligence/libero' not in source
     assert "Could not find any training samples." in source
 
 
@@ -56,9 +70,9 @@ def test_openvla_notebook_supervises_structured_franka_delta_pose_targets():
     )
     source = notebook_path.read_text()
 
-    assert 'FRANKA_ACTION_KEYS = ("dx", "dy", "dz", "dax", "day", "daz", "gripper")' in source
-    assert "TRANSLATION_STEP_M = 0.03" in source
-    assert "ROTATION_STEP_RAD = 0.05" in source
+    assert "FRANKA_ACTION_KEYS," in source
+    assert "TRANSLATION_STEP_M," in source
+    assert "ROTATION_STEP_RAD," in source
     assert "def format_franka_action(action):" in source
     assert "def parse_franka_action(text):" in source
     assert 'gripper=open|close' in source

@@ -170,12 +170,12 @@ data/demos/
 assets_quick.zip
 ```
 
-The terminal will also print a closed-loop summary for each decoder:
+The terminal will also print an offline real-data summary for each decoder:
 
 ```text
-autoregressive: success=..., latency=...ms
-diffusion:      success=..., latency=...ms
-flow_matching:  success=..., latency=...ms
+autoregressive: translation_mae=..., gripper_acc=..., latency=...ms
+diffusion:      translation_mae=..., gripper_acc=..., latency=...ms
+flow_matching:  translation_mae=..., gripper_acc=..., latency=...ms
 ```
 
 ### After Finishing All 3 Kaggle Notebooks
@@ -190,13 +190,13 @@ You will have these outputs under `/kaggle/working/`:
 6. `results/diffusion_vla.pt`
 7. `results/training_curve.png`
 8. `results/diffusion_training_curve.png`
-9. `results/autoregressive/episode_*.gif`
-10. `results/diffusion/episode_*.gif`
-11. `results/flow_matching/episode_*.gif`
-12. `results/comparison_summary.json`
-13. `results/comparison_table.md`
-14. `results/comparison_metrics.png`
-15. `results/decoder_trajectories_3d.png`
+9. `results/autoregressive/offline_eval.json`
+10. `results/diffusion/offline_eval.json`
+11. `results/flow_matching/offline_eval.json`
+12. `results/real_offline_summary.json`
+13. `results/real_offline_table.md`
+14. `results/real_offline_metrics.png`
+15. `results/real_offline_examples.png`
 16. `results/technical_report.md`
 
 ---
@@ -204,20 +204,21 @@ You will have these outputs under `/kaggle/working/`:
 ## 🏗️ System Architecture
 
 ```text
-┌─────────── Training Pipeline ───────────┐    ┌──── Closed-Loop Eval ────┐
+┌─────────── Training Pipeline ───────────┐    ┌── Offline Real-Data Eval ─┐
 │                                          │    │                          │
-│ [MuJoCo Franka Panda]                    │    │  Camera 📷 → Image      │
-│       │                                  │    │       ↓                  │
-│  Scripted Expert Policy                  │    │  VLA Model 🧠           │
-│       │                                  │    │  (3 decoders compared)  │
-│  100 Expert Demos                        │    │       ↓                  │
-│  (image + instruction + action)          │    │  Action → Franka Panda  │
-│       │                                  │    │       ↓                  │
-│  ┌────┴────────────────┐                 │    │  Physics Step → Repeat  │
-│  │ Decoder A: AR        │ ← OpenVLA      │    │       ↓                  │
-│  │ Decoder B: Diffusion │ ← Diffusion    │    │  Success? → 📊 Metrics  │
-│  │ Decoder C: Flow      │ ← π0           │    │            → 🎬 GIF     │
-│  └─────────────────────┘                 │    │            → 📈 Plots   │
+│ Notebook 1: MuJoCo Franka demos          │    │ Held-out DROID frame      │
+│       │                                  │    │ (image + instruction)     │
+│ Notebook 2: OpenVLA QLoRA                │    │       ↓                  │
+│   + DROID real robot data                │    │ 3 decoders predict        │
+│       │                                  │    │ normalized Franka action  │
+│ Notebook 3: Flow/Diffusion               │    │       ↓                  │
+│   trained on DROID train split           │    │ Compare against held-out  │
+│       │                                  │    │ real action target        │
+│  ┌────┴────────────────┐                 │    │       ↓                  │
+│  │ Decoder A: AR        │ ← OpenVLA      │    │ translation / rotation    │
+│  │ Decoder B: Diffusion │ ← Diffusion    │    │ gripper / latency metrics │
+│  │ Decoder C: Flow      │ ← π0           │    │       ↓                  │
+│  └─────────────────────┘                 │    │ report + plots + tables   │
 └──────────────────────────────────────────┘    └──────────────────────────┘
 ```
 
@@ -314,15 +315,15 @@ Upload the files to Kaggle and run the 3 notebooks in order:
 | Step | Notebook | Time | GPU |
 |------|----------|------|-----|
 | 5a | `notebooks/01_env_setup_and_demo.py` | ~10 min | CPU ok |
-| 5b | `notebooks/02_openvla_qlora_finetune.py` | ~1-2 hrs | T4 required |
-| 5c | `notebooks/03_flow_matching_eval.py` | ~40 min | T4 required |
+| 5b | `notebooks/02_openvla_qlora_finetune.py` | ~1-3 hrs | T4 required |
+| 5c | `notebooks/03_flow_matching_eval.py` | ~45-90 min | T4 required |
 
 **Notebook 1** → Collects 100 expert demos in MuJoCo → upload as a Kaggle Dataset  
-**Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA (4-bit quantization, LoRA rank=32)  
-**Notebook 3** → Trains a lightweight FlowMatchingVLA (117M params) + closed-loop eval → GIFs
+**Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA on MuJoCo demos + DROID real-robot data  
+**Notebook 3** → Trains lightweight FlowMatching/Diffusion VLAs + held-out DROID offline eval
 
 If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The install cells in Notebook 2 and 3 do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.
-Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 1000 real samples from [`physical-intelligence/libero`](https://huggingface.co/datasets/physical-intelligence/libero) using its official task map [`meta/tasks.jsonl`](https://huggingface.co/datasets/physical-intelligence/libero/blob/main/meta/tasks.jsonl). The default Kaggle-fast preset also runs for 1 epoch. If neither source yields data, it fails immediately instead of pretending LIBERO was loaded.
+Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 1000 real Franka robot samples from [`cadene/droid_1.0.1_v30`](https://huggingface.co/datasets/cadene/droid_1.0.1_v30). Both Notebook 2 and Notebook 3 import the same DROID-to-Franka conversion helpers from `data/droid_utils.py`, so training and offline evaluation use one shared action interface. The default Kaggle-fast preset also runs for 1 epoch. If neither source yields data, it fails immediately instead of pretending external data was loaded.
 
 ### Step 6: View Results
 
@@ -349,17 +350,18 @@ ls -lh assets_quick.zip
 │   ├── diffusion_head.py           # 🔥 Diffusion action decoder (DDPM/DDIM)
 │   └── dummy_vla.py                # Dummy VLA implementing all 3 decoders for testing
 ├── data/
-│   └── collect_demos.py            # Scripted expert demo collection
+│   ├── collect_demos.py            # Scripted expert demo collection
+│   └── droid_utils.py              # Shared DROID parsing + Franka action adapters
 ├── evaluation/
-│   ├── closed_loop_eval.py         # VLA ↔ MuJoCo closed-loop evaluation loop
-│   └── generate_videos.py          # GIF/video generation from evaluation
+│   ├── closed_loop_eval.py         # Legacy MuJoCo closed-loop evaluation helpers
+│   └── generate_videos.py          # Legacy GIF/video export helpers
 ├── visualization/
 │   ├── plot_trajectories.py        # 3D/2D end-effector trajectory plots
 │   └── success_heatmap.py          # Grasp success rate by object position
 ├── notebooks/
 │   ├── 01_env_setup_and_demo.py    # Kaggle: MuJoCo setup + 100 expert demos
-│   ├── 02_openvla_qlora_finetune.py# Kaggle: OpenVLA-7B QLoRA fine-tuning on T4
-│   └── 03_flow_matching_eval.py    # Kaggle: FlowMatchingVLA train + eval + GIFs
+│   ├── 02_openvla_qlora_finetune.py # Kaggle: OpenVLA-7B QLoRA fine-tuning on T4
+│   └── 03_flow_matching_eval.py    # Kaggle: DROID offline train/eval comparison
 ├── scripts/
 │   └── run_demo.py                 # One-click: full pipeline in ~15 seconds
 ├── tests/
@@ -440,19 +442,22 @@ OpenVLA-7B (7 billion params)
   ↓ Effective batch size: 16 (BS=2 × grad_accum=8)
 ```
 
-### Closed-Loop Evaluation Pipeline
+### Offline Real-Data Evaluation Pipeline
 
 ```text
-For each episode (50 episodes per decoder):
-  1. Reset the env: Franka Panda at home config, randomize object positions
-  2. Select a target object + language instruction
-  3. Loop (max 150 steps):
-     a. Camera renders a 256×256 RGB image
-     b. VLA model: image + instruction → action [dx,dy,dz,dax,day,daz,gripper]
-     c. Jacobian IK: delta-pose action → 7-DOF joint commands
-     d. MuJoCo physics simulation (60 substeps)
-     e. Check: object lifted above 0.35 m? → success
-  4. Record success/failure, trajectory, and frames → GIF
+For each held-out DROID frame:
+  1. Load a real Franka RGB observation + natural language instruction
+  2. Convert the DROID action into this repo's normalized Franka delta-pose interface
+  3. Run each decoder offline:
+     a. Autoregressive OpenVLA → text action → parsed 7-DOF action
+     b. Diffusion VLA → predicted 7-DOF action
+     c. Flow-Matching VLA → predicted 7-DOF action
+  4. Compare predictions against the held-out real action:
+     - translation MAE (cm)
+     - rotation MAE (deg)
+     - gripper open/close accuracy
+     - inference latency
+  5. Save summary tables, plots, and qualitative example panels
 ```
 
 ---
@@ -466,7 +471,7 @@ For each episode (50 episodes per decoder):
 - [x] ~~Franka Panda with parallel gripper~~
 - [x] ~~7-DOF action space (Cartesian + orientation + gripper)~~
 - [ ] Domain randomization (lighting, textures, camera poses)
-- [ ] Sim-to-real transfer analysis
+- [x] ~~Offline evaluation on held-out real DROID data~~
 - [ ] Multi-object sequential manipulation
 
 ## 📄 References
@@ -479,4 +484,4 @@ For each episode (50 episodes per decoder):
 
 ---
 
-*Built as a portfolio project demonstrating a systematic comparison of VLA action decoders for robotic manipulation. The full pipeline — custom Franka Panda environment, 3 decoder implementations, closed-loop evaluation, and Kaggle T4 training — runs from zero with the commands above.*
+*Built as a portfolio project demonstrating a systematic comparison of VLA action decoders for robotic manipulation. The full pipeline — custom Franka Panda environment, OpenVLA fine-tuning, lightweight decoder training, and offline real-data evaluation on DROID — runs from zero with the commands above.*

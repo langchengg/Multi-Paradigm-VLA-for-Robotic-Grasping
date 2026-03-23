@@ -1,3 +1,5 @@
+"""Environment package with lazy imports and shared headless-rendering setup."""
+
 from ._rendering import configure_headless_rendering
 
 

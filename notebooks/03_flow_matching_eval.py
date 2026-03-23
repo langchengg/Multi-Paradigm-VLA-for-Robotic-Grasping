@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════
-  Kaggle Notebook 3: Flow-Matching VLA Training + Closed-Loop
-                     Evaluation + GIF Generation
+  Kaggle Notebook 3: Flow-Matching VLA Training + Real-Data
+                     Offline Evaluation on Held-Out DROID
 ═══════════════════════════════════════════════════════════════════
 
 Prerequisites:
   - Kaggle T4 GPU accelerator enabled
-  - Demo data from Notebook 1 (uploaded as Kaggle Dataset)
+  - Notebook 2 finished and saved an OpenVLA adapter
+  - Internet access to stream a small DROID subset from Hugging Face
 
 This notebook:
-1. Trains a lightweight Flow-Matching VLA (ViT-B + BERT + FlowHead)
-2. Runs closed-loop evaluation in MuJoCo with all 3 decoders
-3. Generates comparison GIFs, trajectory plots, and success heatmap
-4. Produces the final presentation assets
+1. Streams a small held-out slice of real DROID Franka data
+2. Trains lightweight Flow-Matching and Diffusion VLAs on the train split
+3. Evaluates all 3 decoders offline on held-out real robot frames
+4. Saves metrics, plots, sample visualizations, and a technical report
 
-⏱️ Estimated time: 30-60 minutes (training) + 10 min (eval)
-💾 GPU memory: ~8 GB (lightweight model fits T4 easily)
+⏱️ Estimated time: 45-90 minutes
+💾 GPU memory: ~8 GB (lightweight models fit on T4)
 """
 
 # ═══════════════════════════════════════════════════════════════
@@ -24,9 +25,11 @@ This notebook:
 # ═══════════════════════════════════════════════════════════════
 
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 NUMPY_VERSION = "1.26.4"
@@ -61,72 +64,89 @@ def install():
         "peft==0.11.1",
         "bitsandbytes==0.43.1",
         "timm==0.9.10",
-        "mujoco>=3.0.0",
         "Pillow>=9.0.0",
         f"numpy=={NUMPY_VERSION}",
         "matplotlib>=3.7.0",
         "imageio>=2.30.0",
+        "datasets",
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
     verify_torch_numpy_bridge()
-    subprocess.run(
-                   "apt-get update -qq && apt-get install -y -qq "
-                   "libgl1-mesa-glx libgl1-mesa-dev libegl1-mesa-dev "
-                   "libosmesa6-dev libglew-dev patchelf",
-                   shell=True, capture_output=True)
     print("✅ Dependencies installed")
 
-install()
 
-import os
+install()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from envs._rendering import configure_headless_rendering
-
-backend = configure_headless_rendering()
-
-import math
-import time
-import glob
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 from PIL import Image, ImageDraw
+from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
-import mujoco
+from torchvision import transforms
+from transformers import BertModel, BertTokenizer, ViTModel
 
-print(f"✅ Loaded: MuJoCo {mujoco.__version__}, PyTorch {torch.__version__}")
-print(f"   Rendering backend: {backend or os.environ.get('MUJOCO_GL', 'default')}")
+from models.diffusion_head import DiffusionHead
+from models.flow_matching_head import FlowMatchingHead
+from data.droid_utils import (
+    ACTION_MAX,
+    ACTION_MIN,
+    DROID_DEFAULT_FPS,
+    FRANKA_ACTION_KEYS,
+    GRIPPER_CLOSE_VALUE,
+    GRIPPER_OPEN_VALUE,
+    ROTATION_STEP_RAD,
+    TRANSLATION_STEP_M,
+    droid_action_to_franka_action,
+    droid_cartesian_velocity_to_franka_action,
+    ensure_franka_action_7d,
+    image_to_uint8_array,
+    load_droid_task_lookup,
+    sample_get,
+)
+
+print(f"✅ Loaded: PyTorch {torch.__version__}")
 print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Interactive viewer: set ENABLE_VIEWER=1 to open a 3D window (macOS/desktop only)
-ENABLE_VIEWER = os.environ.get("ENABLE_VIEWER", "").strip() == "1"
 
 # ═══════════════════════════════════════════════════════════════
 # Cell 2: Configuration
 # ═══════════════════════════════════════════════════════════════
 
-DEMO_DIR = "/kaggle/input/vla-demos/demos"
 OUTPUT_DIR = "/kaggle/working/results"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Real-data source
+DROID_DATASET_REPO_CANDIDATES = [
+    repo for repo in [
+        os.environ.get("DROID_DATASET_REPO", "").strip() or None,
+        "cadene/droid_1.0.1_v30",
+        "cadene/droid",
+    ]
+    if repo
+]
+DROID_SPLIT = "train"
+DROID_MAX_SAMPLES = 1000
+DROID_EVAL_FRACTION = 0.2
+DROID_FPS = DROID_DEFAULT_FPS
+
 # Training config
-FLOW_TRAIN_EPOCHS = 30
-DIFFUSION_TRAIN_EPOCHS = 30
+FLOW_TRAIN_EPOCHS = 10
+DIFFUSION_TRAIN_EPOCHS = 10
 BATCH_SIZE = 16
 LEARNING_RATE = 3e-4
 IMAGE_SIZE = 224
-ACTION_DIM = 7       # dx, dy, dz, dax, day, daz, gripper
-ACTION_HORIZON = 4   # predict 4 future actions (action chunking)
-NUM_EVAL_EPISODES = 20
-EVAL_MAX_STEPS = 100
+ACTION_DIM = 7
+ACTION_HORIZON = 1
+MAX_SEQ_LEN = 256
+MAX_EVAL_SAMPLES = 200
+QUALITATIVE_EXAMPLES = 6
+
 OPENVLA_BASE_MODEL = "openvla/openvla-7b"
 OPENVLA_CANDIDATE_DIRS = [
     "/kaggle/input/openvla-finetuned/final",
@@ -134,15 +154,6 @@ OPENVLA_CANDIDATE_DIRS = [
     "/kaggle/working/openvla-finetuned/final",
     str(PROJECT_ROOT / "openvla-finetuned" / "final"),
 ]
-
-FRANKA_ACTION_KEYS = ("dx", "dy", "dz", "dax", "day", "daz", "gripper")
-TRANSLATION_STEP_M = 0.03
-ROTATION_STEP_RAD = 0.05
-GRIPPER_OPEN_VALUE = -1.0
-GRIPPER_CLOSE_VALUE = 1.0
-ACTION_MIN = -1.0
-ACTION_MAX = 1.0
-
 
 def find_existing_directory(candidates):
     for candidate in candidates:
@@ -152,22 +163,14 @@ def find_existing_directory(candidates):
 
 
 OPENVLA_MODEL_DIR = find_existing_directory(OPENVLA_CANDIDATE_DIRS)
+
+print("✅ Config ready")
+print(f"   DROID repos: {DROID_DATASET_REPO_CANDIDATES}")
+print(f"   DROID max streamed samples: {DROID_MAX_SAMPLES}")
+print(f"   Held-out eval fraction: {DROID_EVAL_FRACTION:.0%}")
+print(f"   DROID control rate assumption: {DROID_FPS:g} Hz")
+print(f"   Action horizon: {ACTION_HORIZON}")
 print(f"   OpenVLA adapter dir: {OPENVLA_MODEL_DIR or 'not found yet'}")
-
-
-def ensure_franka_action_7d(action, source_name="<unknown>"):
-    action = np.asarray(action, dtype=np.float32).reshape(-1)
-    if action.shape[0] == 7:
-        return np.clip(action, ACTION_MIN, ACTION_MAX)
-    if action.shape[0] == 4:
-        return np.array(
-            [action[0], action[1], action[2], 0.0, 0.0, 0.0, action[3]],
-            dtype=np.float32,
-        )
-    raise ValueError(
-        f"Unsupported action dimension {action.shape[0]} in {source_name}. "
-        "Expected 7-DOF Franka actions or legacy 4-DOF actions."
-    )
 
 
 def format_vla_prompt(instruction):
@@ -210,200 +213,212 @@ def save_json(path, payload):
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
-# ═══════════════════════════════════════════════════════════════
-# Cell 3: Flow-Matching Head (π0-inspired)
-# ═══════════════════════════════════════════════════════════════
-
-class SinusoidalEmbedding(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, t):
-        half = self.dim // 2
-        emb = math.log(10000) / (half - 1)
-        emb = torch.exp(torch.arange(half, device=t.device) * -emb)
-        emb = t.unsqueeze(-1) * emb.unsqueeze(0)
-        return torch.cat([emb.sin(), emb.cos()], dim=-1)
-
-
-class FlowMatchingHead(nn.Module):
-    """
-    Flow-matching action decoder (π0/Physical Intelligence inspired).
-
-    Training: Learn velocity field v_θ(x_t, t, z) where
-      x_t = (1-t)*noise + t*action, t ~ Beta(1.5, 1)
-      Loss = ||v_θ - (action - noise)||²
-
-    Inference: Euler ODE from noise → action in K steps.
-    """
-
-    def __init__(self, feature_dim, action_dim=7, horizon=4,
-                 hidden_dim=512, num_layers=4):
-        super().__init__()
-        self.action_dim = action_dim
-        self.horizon = horizon
-        self.total_dim = action_dim * horizon
-
-        self.feat_proj = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim), nn.SiLU(), nn.LayerNorm(hidden_dim))
-        self.time_embed = nn.Sequential(
-            SinusoidalEmbedding(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
-
-        layers = []
-        in_dim = self.total_dim + 2 * hidden_dim
-        for i in range(num_layers):
-            out = hidden_dim if i < num_layers - 1 else self.total_dim
-            layers.append(nn.Linear(in_dim if i == 0 else hidden_dim, out))
-            if i < num_layers - 1:
-                layers.extend([nn.SiLU(), nn.LayerNorm(out), nn.Dropout(0.1)])
-        self.vel_net = nn.Sequential(*layers)
-
-        self.register_buffer('act_mean', torch.zeros(action_dim))
-        self.register_buffer('act_std', torch.ones(action_dim))
-
-    def set_stats(self, mean, std):
-        self.act_mean.copy_(torch.tensor(mean, dtype=torch.float32))
-        self.act_std.copy_(torch.tensor(std, dtype=torch.float32).clamp(min=1e-6))
-
-    def normalize(self, a):
-        return (a - self.act_mean) / self.act_std
-
-    def denormalize(self, a):
-        return a * self.act_std + self.act_mean
-
-    def forward(self, features, action_gt):
-        """Training: compute flow matching loss."""
-        B = features.shape[0]
-        H = action_gt.shape[1]
-        a_flat = self.normalize(action_gt).reshape(B, -1)
-
-        t = torch.distributions.Beta(1.5, 1.0).sample((B,)).to(features.device)
-        noise = torch.randn_like(a_flat)
-        x_t = (1 - t.unsqueeze(-1)) * noise + t.unsqueeze(-1) * a_flat
-        target_v = a_flat - noise
-
-        feat = self.feat_proj(features)
-        t_emb = self.time_embed(t)
-        pred_v = self.vel_net(torch.cat([x_t, t_emb, feat], dim=-1))
-
-        loss = F.mse_loss(pred_v, target_v)
-        return loss, {'flow_loss': loss.item()}
-
-    @torch.no_grad()
-    def sample(self, features, steps=10):
-        """Inference: Euler ODE integration."""
-        B = features.shape[0]
-        feat = self.feat_proj(features)
-        x = torch.randn(B, self.total_dim, device=features.device)
-        dt = 1.0 / steps
-
-        for i in range(steps):
-            t = torch.full((B,), i * dt, device=features.device)
-            t_emb = self.time_embed(t)
-            v = self.vel_net(torch.cat([x, t_emb, feat], dim=-1))
-            x = x + v * dt
-
-        actions = self.denormalize(x.reshape(B, self.horizon, self.action_dim))
-        return actions
 
 # ═══════════════════════════════════════════════════════════════
-# Cell 4: Lightweight VLA Model
+# Cell 3: DROID Real-Data Loader
 # ═══════════════════════════════════════════════════════════════
 
-from transformers import BertModel, BertTokenizer, ViTModel
-from torchvision import transforms
-from models.diffusion_head import DiffusionHead
+
+def load_real_droid_records(max_samples):
+    """Materialize a manageable subset of held-out real DROID frames into memory."""
+    from datasets import load_dataset
+
+    repo_id = None
+    dataset_stream = None
+    task_lookup = {}
+    last_exc = None
+
+    for candidate in DROID_DATASET_REPO_CANDIDATES:
+        try:
+            task_lookup = load_droid_task_lookup(candidate)
+            dataset_stream = load_dataset(candidate, split=DROID_SPLIT, streaming=True)
+            repo_id = candidate
+            break
+        except Exception as exc:
+            last_exc = exc
+
+    if dataset_stream is None:
+        raise RuntimeError(
+            "Failed to load a DROID dataset repo. Tried: "
+            + ", ".join(DROID_DATASET_REPO_CANDIDATES)
+        ) from last_exc
+
+    records = []
+    for idx, sample in enumerate(dataset_stream):
+        success = sample_get(sample, "is_episode_successful")
+        if success is False:
+            continue
+
+        image = sample_get(
+            sample,
+            "observation.images.exterior_1_left",
+            "observation.images.exterior_image_1_left",
+            "observation.images.exterior_2_left",
+            "observation.images.exterior_image_2_left",
+            "observation.images.wrist_left",
+            "observation.images.wrist_image_left",
+        )
+        instruction = sample_get(
+            sample,
+            "language_instruction",
+            "language_instruction_2",
+            "language_instruction_3",
+        )
+        if instruction is None:
+            task_index = sample_get(sample, "task_index")
+            if task_index is not None:
+                instruction = task_lookup.get(int(task_index))
+        if isinstance(instruction, str) and not instruction.strip():
+            instruction = None
+
+        raw_action = sample_get(sample, "action.original", "action")
+        cartesian_velocity = sample_get(sample, "action.cartesian_velocity")
+        gripper_position = sample_get(sample, "action.gripper_position")
+        gripper_velocity = sample_get(sample, "action.gripper_velocity")
+
+        if image is None or instruction is None:
+            continue
+
+        source_name = f"{repo_id}:{idx}"
+        if cartesian_velocity is not None:
+            action_7d = droid_cartesian_velocity_to_franka_action(
+                cartesian_velocity,
+                gripper_position=gripper_position,
+                gripper_velocity=gripper_velocity,
+                source_name=source_name,
+            )
+        elif raw_action is not None:
+            action_7d = droid_action_to_franka_action(raw_action, source_name=source_name)
+        else:
+            continue
+
+        episode_index = sample_get(sample, "episode_index")
+        if episode_index is None:
+            episode_index = int(idx)
+        frame_index = sample_get(sample, "frame_index")
+        if frame_index is None:
+            frame_index = 0
+
+        records.append({
+            "image": image_to_uint8_array(image, source_name),
+            "instruction": str(instruction),
+            "action_7d": action_7d,
+            "episode_index": int(np.asarray(episode_index).reshape(-1)[0]),
+            "frame_index": int(np.asarray(frame_index).reshape(-1)[0]),
+            "source": "droid",
+            "sample_index": idx,
+        })
+        if len(records) >= max_samples:
+            break
+
+    if not records:
+        raise RuntimeError("No usable DROID samples were loaded for offline evaluation.")
+
+    print(f"✅ Loaded {len(records)} real DROID frames from {repo_id}")
+    return repo_id, records
+
+
+def split_records_by_episode(records, eval_fraction):
+    """Split by episode id to avoid train/eval leakage from adjacent frames."""
+    records = sorted(records, key=lambda r: (r["episode_index"], r["frame_index"]))
+    episode_ids = []
+    seen = set()
+    for record in records:
+        episode_index = record["episode_index"]
+        if episode_index not in seen:
+            seen.add(episode_index)
+            episode_ids.append(episode_index)
+
+    if len(episode_ids) < 2:
+        raise RuntimeError(
+            f"Need at least 2 DROID episodes for an offline split, found {len(episode_ids)}."
+        )
+
+    eval_episodes = max(1, int(round(len(episode_ids) * eval_fraction)))
+    eval_episodes = min(eval_episodes, len(episode_ids) - 1)
+    eval_episode_ids = set(episode_ids[-eval_episodes:])
+
+    train_records = [r for r in records if r["episode_index"] not in eval_episode_ids]
+    eval_records = [r for r in records if r["episode_index"] in eval_episode_ids]
+
+    if not train_records or not eval_records:
+        raise RuntimeError(
+            f"Invalid DROID split: {len(train_records)} train records, {len(eval_records)} eval records."
+        )
+
+    print(
+        "✅ DROID offline split ready: "
+        f"{len(train_records)} train frames, {len(eval_records)} eval frames, "
+        f"{len(episode_ids) - eval_episodes} train episodes, {eval_episodes} eval episodes"
+    )
+    return train_records, eval_records
+
+
+def compute_action_stats(records):
+    actions = np.stack([record["action_7d"] for record in records], axis=0)
+    return actions.mean(axis=0), actions.std(axis=0).clip(min=1e-6)
+
+
+class RealRobotActionDataset(Dataset):
+    """Frame-level DROID dataset for offline one-step action prediction."""
+
+    def __init__(self, records, img_size=224):
+        self.records = list(records)
+        self.transform = transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
+        ])
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        img = Image.fromarray(record["image"])
+        img_t = self.transform(img)
+        action = torch.tensor(record["action_7d"], dtype=torch.float32).unsqueeze(0)
+        return img_t, record["instruction"], action
+
+
+def collate_fn(batch):
+    imgs = torch.stack([b[0] for b in batch])
+    instrs = [b[1] for b in batch]
+    actions = torch.stack([b[2] for b in batch])
+    return imgs, instrs, actions
+
+
+ACTIVE_DROID_REPO, all_droid_records = load_real_droid_records(DROID_MAX_SAMPLES)
+train_records, eval_records = split_records_by_episode(all_droid_records, DROID_EVAL_FRACTION)
+train_action_mean, train_action_std = compute_action_stats(train_records)
+
+train_dataset = RealRobotActionDataset(train_records, img_size=IMAGE_SIZE)
+eval_dataset = RealRobotActionDataset(eval_records, img_size=IMAGE_SIZE)
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    collate_fn=collate_fn,
+    num_workers=2,
+    pin_memory=True,
+)
+
+print(f"✅ Offline datasets ready: {len(train_dataset)} train samples, {len(eval_dataset)} eval samples")
+print(f"   Using DROID repo: {ACTIVE_DROID_REPO}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Cell 4: Lightweight Offline VLA Models
+# ═══════════════════════════════════════════════════════════════
 
 
 class FlowMatchingVLA(nn.Module):
-    """
-    Lightweight VLA with flow-matching decoder.
-    Vision: ViT-B/16 (86M) + Text: BERT-small (29M) + Flow head (~2M)
-    Total: ~117M params — trains easily on T4
-    """
+    """Lightweight VLA with a flow-matching decoder."""
 
-    def __init__(self, action_dim=7, horizon=4):
+    def __init__(self, action_dim=7, horizon=1):
         super().__init__()
-        # Vision encoder
-        self.vision = ViTModel.from_pretrained("google/vit-base-patch16-224")
-        for param in self.vision.parameters():
-            param.requires_grad = False  # freeze vision backbone
-        # Unfreeze last 2 layers for fine-tuning
-        for layer in self.vision.encoder.layer[-2:]:
-            for param in layer.parameters():
-                param.requires_grad = True
-
-        # Text encoder
-        self.text_model = BertModel.from_pretrained("prajjwal1/bert-small")
-        self.tokenizer = BertTokenizer.from_pretrained("prajjwal1/bert-small")
-        for param in self.text_model.parameters():
-            param.requires_grad = False  # freeze
-        for layer in self.text_model.encoder.layer[-1:]:
-            for param in layer.parameters():
-                param.requires_grad = True
-
-        vis_dim = self.vision.config.hidden_size     # 768
-        txt_dim = self.text_model.config.hidden_size  # 512
-        fuse_dim = 512
-
-        self.vis_proj = nn.Linear(vis_dim, fuse_dim)
-        self.txt_proj = nn.Linear(txt_dim, fuse_dim)
-        self.fusion = nn.TransformerEncoderLayer(
-            d_model=fuse_dim, nhead=8, dim_feedforward=1024,
-            dropout=0.1, batch_first=True)
-
-        self.flow_head = FlowMatchingHead(
-            feature_dim=fuse_dim, action_dim=action_dim,
-            horizon=horizon, hidden_dim=512, num_layers=4)
-
-        self.img_transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3),
-        ])
-
-    def encode(self, images, instructions):
-        """Fuse vision + language features."""
-        # Vision
-        vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
-        vis_feat = self.vis_proj(vis_out)
-
-        # Text
-        txt_in = self.tokenizer(instructions, return_tensors="pt", padding=True,
-                                truncation=True, max_length=64).to(images.device)
-        txt_out = self.text_model(**txt_in).last_hidden_state[:, 0]
-        txt_feat = self.txt_proj(txt_out)
-
-        combined = torch.stack([vis_feat, txt_feat], dim=1)
-        fused = self.fusion(combined).mean(dim=1)
-        return fused
-
-    def forward(self, images, instructions, actions_gt):
-        """Training: images + text + gt_actions → loss."""
-        features = self.encode(images, instructions)
-        return self.flow_head(features, actions_gt)
-
-    @torch.no_grad()
-    def predict(self, images, instructions, steps=10):
-        """Inference: images + text → predicted actions."""
-        features = self.encode(images, instructions)
-        return self.flow_head.sample(features, steps=steps)
-
-
-print("✅ FlowMatchingVLA defined")
-
-
-class DiffusionVLA(nn.Module):
-    """
-    Lightweight VLA with diffusion action decoder.
-    Shares the same vision/language backbone as FlowMatchingVLA.
-    """
-
-    def __init__(self, action_dim=7, horizon=4):
-        super().__init__()
-        # Vision encoder
+        self.action_dim = action_dim
+        self.horizon = horizon
         self.vision = ViTModel.from_pretrained("google/vit-base-patch16-224")
         for param in self.vision.parameters():
             param.requires_grad = False
@@ -411,7 +426,6 @@ class DiffusionVLA(nn.Module):
             for param in layer.parameters():
                 param.requires_grad = True
 
-        # Text encoder
         self.text_model = BertModel.from_pretrained("prajjwal1/bert-small")
         self.tokenizer = BertTokenizer.from_pretrained("prajjwal1/bert-small")
         for param in self.text_model.parameters():
@@ -427,9 +441,80 @@ class DiffusionVLA(nn.Module):
         self.vis_proj = nn.Linear(vis_dim, fuse_dim)
         self.txt_proj = nn.Linear(txt_dim, fuse_dim)
         self.fusion = nn.TransformerEncoderLayer(
-            d_model=fuse_dim, nhead=8, dim_feedforward=1024,
-            dropout=0.1, batch_first=True)
+            d_model=fuse_dim, nhead=8, dim_feedforward=1024, dropout=0.1, batch_first=True)
+        self.flow_head = FlowMatchingHead(
+            feature_dim=fuse_dim,
+            action_dim=action_dim,
+            action_horizon=horizon,
+            hidden_dim=512,
+            num_layers=4,
+            num_inference_steps=10,
+        )
+        self.img_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
+        ])
 
+    def encode(self, images, instructions):
+        vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
+        vis_feat = self.vis_proj(vis_out)
+
+        txt_in = self.tokenizer(
+            instructions,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        ).to(images.device)
+        txt_out = self.text_model(**txt_in).last_hidden_state[:, 0]
+        txt_feat = self.txt_proj(txt_out)
+
+        combined = torch.stack([vis_feat, txt_feat], dim=1)
+        fused = self.fusion(combined).mean(dim=1)
+        return fused
+
+    def forward(self, images, instructions, actions_gt):
+        features = self.encode(images, instructions)
+        return self.flow_head(features, actions_gt)
+
+    def set_action_stats(self, mean, std):
+        self.flow_head.set_action_stats(mean, std)
+
+    @torch.no_grad()
+    def predict(self, images, instructions, steps=10):
+        features = self.encode(images, instructions)
+        return self.flow_head.sample(features, num_steps=steps)
+
+
+class DiffusionVLA(nn.Module):
+    """Lightweight VLA with a diffusion action decoder."""
+
+    def __init__(self, action_dim=7, horizon=1):
+        super().__init__()
+        self.vision = ViTModel.from_pretrained("google/vit-base-patch16-224")
+        for param in self.vision.parameters():
+            param.requires_grad = False
+        for layer in self.vision.encoder.layer[-2:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+        self.text_model = BertModel.from_pretrained("prajjwal1/bert-small")
+        self.tokenizer = BertTokenizer.from_pretrained("prajjwal1/bert-small")
+        for param in self.text_model.parameters():
+            param.requires_grad = False
+        for layer in self.text_model.encoder.layer[-1:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+        vis_dim = self.vision.config.hidden_size
+        txt_dim = self.text_model.config.hidden_size
+        fuse_dim = 512
+
+        self.vis_proj = nn.Linear(vis_dim, fuse_dim)
+        self.txt_proj = nn.Linear(txt_dim, fuse_dim)
+        self.fusion = nn.TransformerEncoderLayer(
+            d_model=fuse_dim, nhead=8, dim_feedforward=1024, dropout=0.1, batch_first=True)
         self.diffusion_head = DiffusionHead(
             feature_dim=fuse_dim,
             action_dim=action_dim,
@@ -439,19 +524,23 @@ class DiffusionVLA(nn.Module):
             num_train_timesteps=100,
             num_inference_steps=10,
         )
-
         self.img_transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3),
+            transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
 
     def encode(self, images, instructions):
         vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
         vis_feat = self.vis_proj(vis_out)
 
-        txt_in = self.tokenizer(instructions, return_tensors="pt", padding=True,
-                                truncation=True, max_length=64).to(images.device)
+        txt_in = self.tokenizer(
+            instructions,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        ).to(images.device)
         txt_out = self.text_model(**txt_in).last_hidden_state[:, 0]
         txt_feat = self.txt_proj(txt_out)
 
@@ -472,103 +561,12 @@ class DiffusionVLA(nn.Module):
         return self.diffusion_head.sample(features, num_steps=steps)
 
 
-print("✅ DiffusionVLA defined")
-
-# ═══════════════════════════════════════════════════════════════
-# Cell 5: Dataset for Flow-Matching Training
-# ═══════════════════════════════════════════════════════════════
-
-class FlowDemoDataset(Dataset):
-    """Dataset with action chunking (horizon=4)."""
-
-    def __init__(self, demo_dir, horizon=4, img_size=224):
-        self.horizon = horizon
-        self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5]*3, [0.5]*3),
-        ])
-
-        self.samples = []
-        files = sorted(glob.glob(os.path.join(demo_dir, "demo_*.npz")))
-
-        all_actions = []
-        for f in files:
-            data = np.load(f, allow_pickle=True)
-            if not data.get("success", False):
-                continue
-            images = data["images"]
-            actions = data["actions"]
-            instructions = data["instructions"]
-
-            # Create samples with action horizons
-            for t in range(len(actions) - horizon + 1):
-                action_chunk = actions[t:t+horizon]
-                if action_chunk.shape[-1] == 4:
-                    padded = np.zeros((horizon, ACTION_DIM), dtype=np.float32)
-                    padded[:, :3] = action_chunk[:, :3]
-                    padded[:, 6] = action_chunk[:, 3]
-                    action_chunk = padded
-                elif action_chunk.shape[-1] != ACTION_DIM:
-                    raise ValueError(
-                        f"Unsupported demo action dim {action_chunk.shape[-1]} in {f}. "
-                        f"Expected {ACTION_DIM} or legacy 4."
-                    )
-
-                self.samples.append({
-                    "image": images[t],
-                    "instruction": str(instructions[t]),
-                    "actions": action_chunk.astype(np.float32),  # (H, 7)
-                })
-                all_actions.append(action_chunk[0])
-
-        # Compute action stats
-        all_actions = np.array(all_actions)
-        self.action_mean = all_actions.mean(axis=0)
-        self.action_std = all_actions.std(axis=0)
-        print(f"  Loaded {len(self.samples)} samples, action_mean={self.action_mean}")
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        s = self.samples[idx]
-        img = Image.fromarray(s["image"])
-        img_t = self.transform(img)
-        acts = torch.tensor(s["actions"], dtype=torch.float32)
-        return img_t, s["instruction"], acts
-
-
-def collate_fn(batch):
-    imgs = torch.stack([b[0] for b in batch])
-    instrs = [b[1] for b in batch]
-    actions = torch.stack([b[2] for b in batch])
-    return imgs, instrs, actions
-
-
-# Load dataset
-if not os.path.exists(DEMO_DIR):
-    raise FileNotFoundError(
-        f"Demo dir not found: {DEMO_DIR}. Run Notebook 1 first and attach its demos dataset."
-    )
-
-dataset = FlowDemoDataset(DEMO_DIR, horizon=ACTION_HORIZON)
-loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    collate_fn=collate_fn,
-    num_workers=2,
-    pin_memory=True,
-)
-print(f"✅ Dataset ready: {len(dataset)} samples, {len(loader)} batches")
+print("✅ FlowMatchingVLA and DiffusionVLA defined")
 
 
 def set_model_action_stats(model, mean, std):
-    if hasattr(model, "flow_head"):
-        model.flow_head.set_stats(mean, std)
-    elif hasattr(model, "diffusion_head"):
-        model.diffusion_head.set_action_stats(mean, std)
+    if hasattr(model, "set_action_stats"):
+        model.set_action_stats(mean, std)
     else:
         raise AttributeError("Model does not expose a supported action head.")
 
@@ -579,8 +577,8 @@ def count_parameters(model):
     return total, trainable
 
 
-def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_name):
-    set_model_action_stats(model, dataset.action_mean, dataset.action_std)
+def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_name, action_mean, action_std):
+    set_model_action_stats(model, action_mean, action_std)
     total, trainable = count_parameters(model)
     print(f"✅ {run_name}: {total/1e6:.1f}M params, {trainable/1e6:.1f}M trainable")
 
@@ -594,9 +592,9 @@ def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_
         T_max=max(num_epochs * len(loader), 1),
     )
 
-    print(f"\n{'='*60}")
-    print(f"Training {run_name} ({num_epochs} epochs)")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print(f"Training {run_name} on real DROID data ({num_epochs} epochs)")
+    print(f"{'=' * 60}")
 
     model.train()
     train_losses = []
@@ -606,7 +604,6 @@ def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_
         epoch_loss = 0.0
         for batch_idx, (imgs, instrs, acts) in enumerate(loader):
             imgs, acts = imgs.to(DEVICE), acts.to(DEVICE)
-
             loss, info = model(imgs, instrs, acts)
             loss.backward()
 
@@ -621,7 +618,7 @@ def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_
         avg = epoch_loss / max(len(loader), 1)
         train_losses.append(avg)
 
-        if (epoch + 1) % 5 == 0 or epoch == 0 or epoch == num_epochs - 1:
+        if (epoch + 1) % 2 == 0 or epoch == 0 or epoch == num_epochs - 1:
             metric_name, metric_value = next(iter(info.items()))
             print(
                 f"  Epoch {epoch+1}/{num_epochs} | Loss: {avg:.4f} | "
@@ -630,10 +627,11 @@ def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_
 
     checkpoint = {
         "model_state_dict": model.state_dict(),
-        "action_mean": dataset.action_mean,
-        "action_std": dataset.action_std,
+        "action_mean": action_mean,
+        "action_std": action_std,
         "train_losses": train_losses,
         "run_name": run_name,
+        "data_repo": ACTIVE_DROID_REPO,
     }
     torch.save(checkpoint, os.path.join(OUTPUT_DIR, checkpoint_name))
 
@@ -654,36 +652,38 @@ def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_
 
 
 # ═══════════════════════════════════════════════════════════════
-# Cell 6: Train Flow-Matching + Diffusion VLAs
+# Cell 5: Train Flow-Matching + Diffusion VLAs on DROID
 # ═══════════════════════════════════════════════════════════════
 
 flow_model = FlowMatchingVLA(action_dim=ACTION_DIM, horizon=ACTION_HORIZON).to(DEVICE)
 flow_model, flow_train_losses = train_vla_model(
     flow_model,
-    loader,
+    train_loader,
     FLOW_TRAIN_EPOCHS,
     run_name="flow_matching",
     checkpoint_name="flow_matching_vla.pt",
     curve_name="flow_matching_training_curve.png",
+    action_mean=train_action_mean,
+    action_std=train_action_std,
 )
 
 diffusion_model = DiffusionVLA(action_dim=ACTION_DIM, horizon=ACTION_HORIZON).to(DEVICE)
 diffusion_model, diffusion_train_losses = train_vla_model(
     diffusion_model,
-    loader,
+    train_loader,
     DIFFUSION_TRAIN_EPOCHS,
     run_name="diffusion",
     checkpoint_name="diffusion_vla.pt",
     curve_name="diffusion_training_curve.png",
+    action_mean=train_action_mean,
+    action_std=train_action_std,
 )
 
 
 # ═══════════════════════════════════════════════════════════════
-# Cell 7: MuJoCo Environment + Comparison Evaluator
+# Cell 6: Offline Evaluators for All 3 Decoders
 # ═══════════════════════════════════════════════════════════════
 
-from envs.franka_grasp_env import FrankaGraspEnv
-from evaluation.closed_loop_eval import VLAMuJoCoEvaluator
 from peft import PeftModel
 from transformers import AutoProcessor, BitsAndBytesConfig
 try:
@@ -699,7 +699,7 @@ class FlowMatchingPolicyWrapper:
         self.model = model.eval()
 
     @torch.no_grad()
-    def predict_action(self, image_np, instruction, **_kwargs):
+    def predict_action(self, image_np, instruction):
         img = Image.fromarray(image_np)
         img_t = self.model.img_transform(img).unsqueeze(0).to(DEVICE)
         sync_cuda()
@@ -717,7 +717,7 @@ class DiffusionPolicyWrapper:
         self.model = model.eval()
 
     @torch.no_grad()
-    def predict_action(self, image_np, instruction, **_kwargs):
+    def predict_action(self, image_np, instruction):
         img = Image.fromarray(image_np)
         img_t = self.model.img_transform(img).unsqueeze(0).to(DEVICE)
         sync_cuda()
@@ -763,30 +763,20 @@ class OpenVLAPolicyWrapper:
         else:
             model_kwargs["torch_dtype"] = torch.float32
 
-        base_model = OpenVLAModelClass.from_pretrained(
-            self.base_model_name,
-            **model_kwargs,
-        )
+        base_model = OpenVLAModelClass.from_pretrained(self.base_model_name, **model_kwargs)
         self.model = PeftModel.from_pretrained(base_model, self.adapter_dir)
-        self.processor = AutoProcessor.from_pretrained(
-            self.adapter_dir,
-            trust_remote_code=True,
-        )
+        self.processor = AutoProcessor.from_pretrained(self.adapter_dir, trust_remote_code=True)
         self.model.eval()
         self.input_device = next(self.model.parameters()).device
 
     @torch.no_grad()
-    def predict_action(self, image_np, instruction, **_kwargs):
+    def predict_action(self, image_np, instruction):
         if self.model is None:
             self._load()
 
         prompt = format_vla_prompt(instruction)
         img = Image.fromarray(image_np)
-        inputs = self.processor(
-            images=[img],
-            text=[prompt],
-            return_tensors="pt",
-        )
+        inputs = self.processor(images=[img], text=[prompt], return_tensors="pt")
         inputs = {k: v.to(self.input_device) for k, v in inputs.items()}
 
         sync_cuda()
@@ -805,7 +795,10 @@ class OpenVLAPolicyWrapper:
         action = parse_franka_action(generated_text)
         parse_failed = action is None
         if action is None:
-            action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, GRIPPER_OPEN_VALUE], dtype=np.float32)
+            action = np.array(
+                [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, GRIPPER_OPEN_VALUE],
+                dtype=np.float32,
+            )
 
         return action, {
             "inference_time_ms": (time.time() - start) * 1000,
@@ -820,77 +813,128 @@ class OpenVLAPolicyWrapper:
             torch.cuda.empty_cache()
 
 
-def evaluate_policy(name, policy, env):
+def compute_prediction_metrics(pred_action, target_action):
+    pred_action = ensure_franka_action_7d(pred_action, "prediction")
+    target_action = ensure_franka_action_7d(target_action, "target")
+    diff = pred_action - target_action
+    translation_mae_cm = float(np.mean(np.abs(diff[:3]) * TRANSLATION_STEP_M * 100.0))
+    rotation_mae_deg = float(np.mean(np.abs(diff[3:6]) * ROTATION_STEP_RAD * 180.0 / np.pi))
+    gripper_accuracy = float((pred_action[6] > 0) == (target_action[6] > 0))
+    normalized_l1 = float(np.mean(np.abs(diff)))
+    return {
+        "translation_mae_cm": translation_mae_cm,
+        "rotation_mae_deg": rotation_mae_deg,
+        "gripper_accuracy": gripper_accuracy,
+        "normalized_l1": normalized_l1,
+    }
+
+
+class OfflineRealDataEvaluator:
+    """Evaluate a policy on held-out real robot frames without environment rollouts."""
+
+    def __init__(self, model, records):
+        self.model = model
+        self.records = records
+
+    def evaluate(self, max_samples=None, verbose=True):
+        subset = self.records[:max_samples] if max_samples is not None else self.records
+        latencies = []
+        translation_errors = []
+        rotation_errors = []
+        normalized_l1s = []
+        gripper_matches = []
+        parse_failures = []
+        examples = []
+
+        for index, record in enumerate(subset):
+            pred_action, info = self.model.predict_action(record["image"], record["instruction"])
+            metrics = compute_prediction_metrics(pred_action, record["action_7d"])
+            latencies.append(float(info.get("inference_time_ms", 0.0)))
+            translation_errors.append(metrics["translation_mae_cm"])
+            rotation_errors.append(metrics["rotation_mae_deg"])
+            normalized_l1s.append(metrics["normalized_l1"])
+            gripper_matches.append(metrics["gripper_accuracy"])
+            parse_failures.append(float(info.get("parse_failed", False)))
+
+            example = {
+                "sample_id": f"{record['episode_index']}-{record['frame_index']}",
+                "episode_index": int(record["episode_index"]),
+                "frame_index": int(record["frame_index"]),
+                "instruction": record["instruction"],
+                "target_action": record["action_7d"].tolist(),
+                "pred_action": pred_action.tolist(),
+                "metrics": metrics,
+            }
+            if "generated_text" in info:
+                example["generated_text"] = info["generated_text"]
+            examples.append(example)
+
+            if verbose and (index + 1) % 25 == 0:
+                print(
+                    f"  Evaluated {index+1}/{len(subset)} samples | "
+                    f"translation MAE={np.mean(translation_errors):.2f} cm | "
+                    f"gripper acc={np.mean(gripper_matches):.1%}"
+                )
+
+        summary = {
+            "num_examples": int(len(subset)),
+            "translation_mae_cm": float(np.mean(translation_errors)),
+            "rotation_mae_deg": float(np.mean(rotation_errors)),
+            "normalized_l1": float(np.mean(normalized_l1s)),
+            "gripper_accuracy": float(np.mean(gripper_matches)),
+            "parse_fail_rate": float(np.mean(parse_failures)),
+            "avg_inference_ms": float(np.mean(latencies)),
+            "p50_inference_ms": float(np.percentile(latencies, 50)),
+            "p95_inference_ms": float(np.percentile(latencies, 95)),
+        }
+        return {"summary": summary, "examples": examples}
+
+
+def evaluate_policy_offline(name, policy, records):
     save_dir = os.path.join(OUTPUT_DIR, name)
-    evaluator = VLAMuJoCoEvaluator(
-        model=policy,
-        env=env,
-        use_oracle_info=False,
-    )
-    return evaluator.evaluate(
-        num_episodes=NUM_EVAL_EPISODES,
-        max_steps=EVAL_MAX_STEPS,
-        record_video=True,
-        save_dir=save_dir,
-        verbose=True,
-        visualize=ENABLE_VIEWER,
-    )
+    os.makedirs(save_dir, exist_ok=True)
+    evaluator = OfflineRealDataEvaluator(model=policy, records=records)
+    result = evaluator.evaluate(max_samples=MAX_EVAL_SAMPLES, verbose=True)
+    save_json(os.path.join(save_dir, "offline_eval.json"), result)
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════
-# Cell 8: Closed-Loop Comparison Across All 3 Methods
+# Cell 7: Offline Real-Data Comparison Across All 3 Methods
 # ═══════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 60)
-print("Closed-Loop Evaluation: Autoregressive vs Diffusion vs Flow-Matching")
+print("Offline Real-Data Evaluation: Autoregressive vs Diffusion vs Flow-Matching")
 print("=" * 60)
 
 if OPENVLA_MODEL_DIR is None:
     raise FileNotFoundError(
-        "Could not find Notebook 2 output. Expected one of:\n- " +
-        "\n- ".join(OPENVLA_CANDIDATE_DIRS)
+        "Could not find Notebook 2 output. Expected one of:\n- "
+        + "\n- ".join(OPENVLA_CANDIDATE_DIRS)
     )
 
 comparison = {}
-env = FrankaGraspEnv(image_size=256, camera_name="frontview")
 
 flow_policy = FlowMatchingPolicyWrapper(flow_model)
-comparison["flow_matching"] = evaluate_policy("flow_matching", flow_policy, env)
+comparison["flow_matching"] = evaluate_policy_offline("flow_matching", flow_policy, eval_records)
 flow_model.to("cpu")
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 diffusion_policy = DiffusionPolicyWrapper(diffusion_model)
-comparison["diffusion"] = evaluate_policy("diffusion", diffusion_policy, env)
+comparison["diffusion"] = evaluate_policy_offline("diffusion", diffusion_policy, eval_records)
 diffusion_model.to("cpu")
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 
 openvla_policy = OpenVLAPolicyWrapper(OPENVLA_MODEL_DIR)
-comparison["autoregressive"] = evaluate_policy("autoregressive", openvla_policy, env)
+comparison["autoregressive"] = evaluate_policy_offline("autoregressive", openvla_policy, eval_records)
 openvla_policy.close()
 
-env.close()
-
 
 # ═══════════════════════════════════════════════════════════════
-# Cell 9: Save Comparison Summary + Plots
+# Cell 8: Save Offline Comparison Summary + Plots
 # ═══════════════════════════════════════════════════════════════
-
-comparison_summary = {
-    name: {
-        "success_rate": float(result["summary"]["success_rate"]),
-        "avg_steps": float(result["summary"]["avg_steps"]),
-        "std_steps": float(result["summary"]["std_steps"]),
-        "avg_reward": float(result["summary"].get("avg_reward", 0.0)),
-        "avg_inference_ms": float(result["summary"].get("avg_inference_ms", 0.0)),
-        "p50_inference_ms": float(result["summary"].get("p50_inference_ms", 0.0)),
-        "p95_inference_ms": float(result["summary"].get("p95_inference_ms", 0.0)),
-        "num_episodes": int(result["summary"]["num_episodes"]),
-    }
-    for name, result in comparison.items()
-}
-save_json(os.path.join(OUTPUT_DIR, "comparison_summary.json"), comparison_summary)
 
 ordered_names = ["autoregressive", "diffusion", "flow_matching"]
 display_names = {
@@ -899,124 +943,201 @@ display_names = {
     "flow_matching": "Flow-Matching",
 }
 
-print("\n" + "=" * 70)
-print("FINAL COMPARISON TABLE")
-print("=" * 70)
-print(f"{'Decoder':<20} {'Success%':>10} {'Avg Steps':>10} {'P50(ms)':>12}")
-print("-" * 60)
-for name in ordered_names:
-    summary = comparison[name]["summary"]
-    print(
-        f"{display_names[name]:<20} {summary['success_rate']:>9.0%} "
-        f"{summary['avg_steps']:>10.1f} {summary['p50_inference_ms']:>11.1f}"
-    )
-print("=" * 70)
+comparison_summary = {
+    name: {
+        "translation_mae_cm": float(result["summary"]["translation_mae_cm"]),
+        "rotation_mae_deg": float(result["summary"]["rotation_mae_deg"]),
+        "normalized_l1": float(result["summary"]["normalized_l1"]),
+        "gripper_accuracy": float(result["summary"]["gripper_accuracy"]),
+        "parse_fail_rate": float(result["summary"]["parse_fail_rate"]),
+        "avg_inference_ms": float(result["summary"]["avg_inference_ms"]),
+        "p50_inference_ms": float(result["summary"]["p50_inference_ms"]),
+        "p95_inference_ms": float(result["summary"]["p95_inference_ms"]),
+        "num_examples": int(result["summary"]["num_examples"]),
+    }
+    for name, result in comparison.items()
+}
+save_json(os.path.join(OUTPUT_DIR, "real_offline_summary.json"), comparison_summary)
 
-with open(os.path.join(OUTPUT_DIR, "comparison_table.md"), "w") as f:
-    f.write("| Decoder | Success Rate | Avg Steps | P50 Latency |\n")
-    f.write("|---|---:|---:|---:|\n")
+print("\n" + "=" * 78)
+print("OFFLINE REAL-DATA COMPARISON TABLE")
+print("=" * 78)
+print(f"{'Decoder':<20} {'Trans(cm)':>10} {'Rot(deg)':>10} {'Grip Acc':>10} {'P50(ms)':>10}")
+print("-" * 70)
+for name in ordered_names:
+    summary = comparison_summary[name]
+    print(
+        f"{display_names[name]:<20} {summary['translation_mae_cm']:>10.2f} "
+        f"{summary['rotation_mae_deg']:>10.2f} {summary['gripper_accuracy']:>9.0%} "
+        f"{summary['p50_inference_ms']:>10.1f}"
+    )
+print("=" * 78)
+
+with open(os.path.join(OUTPUT_DIR, "real_offline_table.md"), "w") as f:
+    f.write("| Decoder | Translation MAE (cm) | Rotation MAE (deg) | Gripper Accuracy | P50 Latency |\n")
+    f.write("|---|---:|---:|---:|---:|\n")
     for name in ordered_names:
-        summary = comparison[name]["summary"]
+        summary = comparison_summary[name]
         f.write(
-            f"| {display_names[name]} | {summary['success_rate']:.1%} | "
-            f"{summary['avg_steps']:.1f} | {summary['p50_inference_ms']:.1f} ms |\n"
+            f"| {display_names[name]} | {summary['translation_mae_cm']:.2f} | "
+            f"{summary['rotation_mae_deg']:.2f} | {summary['gripper_accuracy']:.1%} | "
+            f"{summary['p50_inference_ms']:.1f} ms |\n"
         )
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-success_values = [comparison[name]["summary"]["success_rate"] for name in ordered_names]
-latency_values = [comparison[name]["summary"]["p50_inference_ms"] for name in ordered_names]
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
 bar_colors = ["#4e79a7", "#f28e2b", "#59a14f"]
+name_labels = [display_names[n] for n in ordered_names]
 
-axes[0].bar([display_names[n] for n in ordered_names], success_values, color=bar_colors)
-axes[0].set_ylim(0, 1.0)
-axes[0].set_ylabel("Success Rate")
-axes[0].set_title("Closed-Loop Success Rate", fontweight="bold")
+axes[0, 0].bar(name_labels, [comparison_summary[n]["translation_mae_cm"] for n in ordered_names], color=bar_colors)
+axes[0, 0].set_ylabel("Translation MAE (cm)")
+axes[0, 0].set_title("Held-Out Real Data", fontweight="bold")
 
-axes[1].bar([display_names[n] for n in ordered_names], latency_values, color=bar_colors)
-axes[1].set_ylabel("P50 Inference Latency (ms)")
-axes[1].set_title("Closed-Loop Inference Latency", fontweight="bold")
+axes[0, 1].bar(name_labels, [comparison_summary[n]["rotation_mae_deg"] for n in ordered_names], color=bar_colors)
+axes[0, 1].set_ylabel("Rotation MAE (deg)")
+axes[0, 1].set_title("Held-Out Real Data", fontweight="bold")
 
-for ax in axes:
+axes[1, 0].bar(name_labels, [comparison_summary[n]["gripper_accuracy"] for n in ordered_names], color=bar_colors)
+axes[1, 0].set_ylim(0, 1.0)
+axes[1, 0].set_ylabel("Gripper Accuracy")
+axes[1, 0].set_title("Binary Open/Close Accuracy", fontweight="bold")
+
+axes[1, 1].bar(name_labels, [comparison_summary[n]["p50_inference_ms"] for n in ordered_names], color=bar_colors)
+axes[1, 1].set_ylabel("P50 Inference Latency (ms)")
+axes[1, 1].set_title("Inference Latency", fontweight="bold")
+
+for ax in axes.ravel():
     ax.grid(True, axis="y", alpha=0.25)
 plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "comparison_metrics.png"), dpi=150)
+plt.savefig(os.path.join(OUTPUT_DIR, "real_offline_metrics.png"), dpi=150)
 plt.close()
 
-fig = plt.figure(figsize=(12, 9))
-ax = fig.add_subplot(111, projection='3d')
-colors = {
-    "autoregressive": "#4e79a7",
-    "diffusion": "#f28e2b",
-    "flow_matching": "#59a14f",
+
+def render_qualitative_examples(eval_records, comparison, output_path):
+    selected = eval_records[: min(QUALITATIVE_EXAMPLES, len(eval_records))]
+    row_height = 220
+    canvas_width = 1200
+    canvas = Image.new("RGB", (canvas_width, row_height * len(selected)), color="white")
+
+    prediction_lookup = {
+        name: {example["sample_id"]: example for example in result["examples"]}
+        for name, result in comparison.items()
+    }
+
+    for row, record in enumerate(selected):
+        sample_id = f"{record['episode_index']}-{record['frame_index']}"
+        img = Image.fromarray(record["image"]).resize((320, 180))
+        panel = Image.new("RGB", (canvas_width, row_height), color="white")
+        panel.paste(img, (20, 20))
+        draw = ImageDraw.Draw(panel)
+
+        lines = [
+            f"Example {row+1} | episode={record['episode_index']} frame={record['frame_index']}",
+            f"Instruction: {record['instruction']}",
+            f"GT: {record['action_7d'].tolist()}",
+        ]
+        for name in ordered_names:
+            example = prediction_lookup[name][sample_id]
+            lines.append(f"{display_names[name]}: {example['pred_action']}")
+            lines.append(
+                f"  trans={example['metrics']['translation_mae_cm']:.2f}cm "
+                f"rot={example['metrics']['rotation_mae_deg']:.2f}deg "
+                f"grip={'✓' if example['metrics']['gripper_accuracy'] else '✗'}"
+            )
+        draw.multiline_text((370, 20), "\n".join(lines), fill="black", spacing=5)
+        canvas.paste(panel, (0, row * row_height))
+
+    canvas.save(output_path)
+
+
+render_qualitative_examples(
+    eval_records[:MAX_EVAL_SAMPLES],
+    comparison,
+    os.path.join(OUTPUT_DIR, "real_offline_examples.png"),
+)
+
+combined_predictions = []
+per_model_examples = {
+    name: {example["sample_id"]: example for example in result["examples"]}
+    for name, result in comparison.items()
 }
-for name in ordered_names:
-    trajectory = comparison[name]["trajectories"][0]["gripper_positions"]
-    pos = np.array(trajectory)
-    success = comparison[name]["successes"][0]
-    label = f"{display_names[name]} ({'✓' if success else '✗'})"
-    ax.plot(pos[:, 0], pos[:, 1], pos[:, 2], label=label, linewidth=2.5, color=colors[name])
-    ax.scatter(*pos[0], color=colors[name], s=80, marker='o', edgecolors='black')
-    ax.scatter(*pos[-1], color=colors[name], s=80, marker='s', edgecolors='black')
+for record in eval_records[:MAX_EVAL_SAMPLES]:
+    sample_id = f"{record['episode_index']}-{record['frame_index']}"
+    combined_predictions.append({
+        "sample_id": sample_id,
+        "instruction": record["instruction"],
+        "target_action": record["action_7d"].tolist(),
+        "autoregressive": per_model_examples["autoregressive"][sample_id],
+        "diffusion": per_model_examples["diffusion"][sample_id],
+        "flow_matching": per_model_examples["flow_matching"][sample_id],
+    })
 
-ax.set_xlabel('X (m)')
-ax.set_ylabel('Y (m)')
-ax.set_zlabel('Z (m)')
-ax.set_title('Decoder Comparison: End-Effector Trajectories', fontweight='bold')
-ax.legend(fontsize=10, loc='upper left')
-ax.view_init(elev=25, azim=-60)
-plt.tight_layout()
-plt.savefig(os.path.join(OUTPUT_DIR, "decoder_trajectories_3d.png"), dpi=150)
-plt.savefig(os.path.join(OUTPUT_DIR, "flow_trajectories_3d.png"), dpi=150)
-plt.close()
+with open(os.path.join(OUTPUT_DIR, "real_offline_predictions.jsonl"), "w") as f:
+    for row in combined_predictions:
+        f.write(json.dumps(row) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Cell 10: Generate Technical Report from Real Results
+# Cell 9: Generate Technical Report from Real Offline Results
 # ═══════════════════════════════════════════════════════════════
 
-best_success_name = max(ordered_names, key=lambda name: comparison[name]["summary"]["success_rate"])
-fastest_name = min(ordered_names, key=lambda name: comparison[name]["summary"]["p50_inference_ms"])
+best_translation_name = min(ordered_names, key=lambda name: comparison_summary[name]["translation_mae_cm"])
+best_gripper_name = max(ordered_names, key=lambda name: comparison_summary[name]["gripper_accuracy"])
+fastest_name = min(ordered_names, key=lambda name: comparison_summary[name]["p50_inference_ms"])
 
 report_lines = [
-    "# Multi-Paradigm VLA for Robotic Grasping — Technical Report",
+    "# Multi-Paradigm VLA for Robotic Grasping — Offline Real-Data Report",
     "",
     "## 1. Overview",
-    "This run compares three closed-loop VLA action decoders on the Franka Panda grasping task:",
+    "This run compares three VLA action decoders on held-out real DROID robot frames:",
     "- Autoregressive: fine-tuned OpenVLA from Notebook 2",
     "- Diffusion: lightweight ViT+BERT+DiffusionHead baseline",
     "- Flow-Matching: lightweight ViT+BERT+FlowMatchingHead baseline",
     "",
-    "## 2. Environment",
-    "- MuJoCo Franka Panda 7-DOF arm with parallel gripper",
-    "- 7-DOF action interface: [dx, dy, dz, dax, day, daz, gripper]",
-    "- 256×256 camera observations for closed-loop control",
+    "## 2. Dataset",
+    f"- Source: {ACTIVE_DROID_REPO}",
+    f"- Total streamed frames: {len(all_droid_records)}",
+    f"- Train frames: {len(train_records)}",
+    f"- Eval frames: {min(len(eval_records), MAX_EVAL_SAMPLES)}",
+    "- Robot platform: real Franka Panda data from DROID",
+    "- Evaluation mode: offline one-step action prediction on held-out frames",
     "",
-    "## 3. Closed-Loop Results",
+    "## 3. Metrics",
+    "- Translation MAE (cm): average absolute XYZ delta error after converting to this repo's control interface",
+    "- Rotation MAE (deg): average absolute roll/pitch/yaw delta error",
+    "- Gripper Accuracy: binary open/close agreement",
+    "- P50 Latency: median inference latency per frame",
+    "",
+    "## 4. Results",
 ]
 for name in ordered_names:
-    summary = comparison[name]["summary"]
+    summary = comparison_summary[name]
     report_lines.extend([
         f"### {display_names[name]}",
-        f"- Success rate: {summary['success_rate']:.1%}",
-        f"- Average steps: {summary['avg_steps']:.1f} ± {summary['std_steps']:.1f}",
-        f"- P50 inference latency: {summary['p50_inference_ms']:.1f} ms",
+        f"- Translation MAE: {summary['translation_mae_cm']:.2f} cm",
+        f"- Rotation MAE: {summary['rotation_mae_deg']:.2f} deg",
+        f"- Gripper Accuracy: {summary['gripper_accuracy']:.1%}",
+        f"- Parse Fail Rate: {summary['parse_fail_rate']:.1%}",
+        f"- P50 Inference Latency: {summary['p50_inference_ms']:.1f} ms",
         "",
     ])
 
 report_lines.extend([
-    "## 4. Summary",
-    f"- Best success rate: {display_names[best_success_name]} ({comparison[best_success_name]['summary']['success_rate']:.1%})",
-    f"- Fastest inference: {display_names[fastest_name]} ({comparison[fastest_name]['summary']['p50_inference_ms']:.1f} ms p50)",
-    "- GIFs for the first 5 episodes of each decoder are saved in separate output folders.",
+    "## 5. Summary",
+    f"- Best translation error: {display_names[best_translation_name]} ({comparison_summary[best_translation_name]['translation_mae_cm']:.2f} cm)",
+    f"- Best gripper accuracy: {display_names[best_gripper_name]} ({comparison_summary[best_gripper_name]['gripper_accuracy']:.1%})",
+    f"- Fastest inference: {display_names[fastest_name]} ({comparison_summary[fastest_name]['p50_inference_ms']:.1f} ms p50)",
     "",
-    "## 5. Output Files",
-    "- autoregressive/episode_*.gif",
-    "- diffusion/episode_*.gif",
-    "- flow_matching/episode_*.gif",
-    "- comparison_summary.json",
-    "- comparison_table.md",
-    "- comparison_metrics.png",
-    "- decoder_trajectories_3d.png",
+    "## 6. Output Files",
+    "- flow_matching_vla.pt",
+    "- diffusion_vla.pt",
+    "- training_curve.png",
+    "- diffusion_training_curve.png",
+    "- real_offline_summary.json",
+    "- real_offline_table.md",
+    "- real_offline_metrics.png",
+    "- real_offline_examples.png",
+    "- real_offline_predictions.jsonl",
+    "- technical_report.md",
 ])
 
 with open(os.path.join(OUTPUT_DIR, "technical_report.md"), "w") as f:
@@ -1025,18 +1146,9 @@ with open(os.path.join(OUTPUT_DIR, "technical_report.md"), "w") as f:
 print(f"\n✅ All outputs saved to {OUTPUT_DIR}")
 print(f"   📊 training_curve.png")
 print(f"   📊 diffusion_training_curve.png")
-print(f"   📊 comparison_metrics.png")
-print(f"   🎬 autoregressive/episode_*.gif")
-print(f"   🎬 diffusion/episode_*.gif")
-print(f"   🎬 flow_matching/episode_*.gif")
-print(f"   📈 decoder_trajectories_3d.png")
-print(f"   📄 comparison_summary.json")
-print(f"   📄 comparison_table.md")
+print(f"   📊 real_offline_metrics.png")
+print(f"   🖼️ real_offline_examples.png")
+print(f"   📄 real_offline_summary.json")
+print(f"   📄 real_offline_table.md")
+print(f"   📄 real_offline_predictions.jsonl")
 print(f"   📄 technical_report.md")
-
-for root, _, files in os.walk(OUTPUT_DIR):
-    for name in sorted(files):
-        path = os.path.join(root, name)
-        size = os.path.getsize(path)
-        rel = os.path.relpath(path, OUTPUT_DIR)
-        print(f"   📄 {rel} ({size/1024:.1f} KB)")
