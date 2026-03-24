@@ -271,6 +271,14 @@ def load_droid_task_lookup(repo_id):
     return task_lookup
 
 
+def _extract_episode_instruction(tasks):
+    """Return the first non-empty episode-level instruction, if present."""
+    for task in tasks or []:
+        if isinstance(task, str) and task.strip():
+            return task.strip()
+    return None
+
+
 @lru_cache(maxsize=4)
 def load_droid_info(repo_id):
     """Load DROID dataset metadata required to resolve video-backed image streams."""
@@ -358,6 +366,7 @@ def iter_droid_v30_stream(
     max_samples=None,
     camera_keys=DROID_CAMERA_KEYS,
     max_open_videos=4,
+    skip_unlabeled_episodes=True,
 ):
     """
     Yield DROID v3 frame rows with decoded RGB images.
@@ -411,6 +420,9 @@ def iter_droid_v30_stream(
                     )
 
                 episode_row = episode_rows[local_episode_idx]
+                episode_instruction = _extract_episode_instruction(episode_row.get("tasks"))
+                if skip_unlabeled_episodes and episode_instruction is None:
+                    continue
                 frame_index = int(sample_get(sample, "frame_index") or 0)
 
                 image = None
@@ -449,6 +461,7 @@ def iter_droid_v30_stream(
 
                 out = dict(sample)
                 out["observation.images.active_camera"] = used_camera
+                out["episode_instruction"] = episode_instruction
                 out["decoded_image"] = image
                 yield out
                 yielded += 1

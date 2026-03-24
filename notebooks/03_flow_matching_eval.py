@@ -269,6 +269,7 @@ def load_real_droid_records(max_samples):
                 "language_instruction",
                 "language_instruction_2",
                 "language_instruction_3",
+                "episode_instruction",
             )
             if instruction is None:
                 task_index = sample_get(sample, "task_index")
