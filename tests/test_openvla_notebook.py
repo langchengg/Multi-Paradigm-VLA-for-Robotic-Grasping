@@ -27,6 +27,7 @@ def test_openvla_notebook_loads_real_data_from_droid():
     source = notebook_path.read_text()
 
     assert 'USE_DROID = True' in source
+    assert 'USE_MUJOCO_DEMOS = os.environ.get("VLA_USE_MUJOCO_DEMOS", "1")' in source
     assert 'DROID_DATASET_REPO_CANDIDATES = [' in source
     assert '"cadene/droid_1.0.1_v30"' in source
     assert "DROID_MAX_SAMPLES = 500" in source
@@ -36,6 +37,7 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert '"imageio-ffmpeg>=0.4.9"' in source
     assert "from data.droid_utils import (" in source
     assert "def resolve_demo_dir(preferred_dir):" in source
+    assert 'if not USE_MUJOCO_DEMOS:' in source
     assert "iter_droid_v30_stream," in source
     assert "load_droid_info," in source
     assert "load_droid_task_lookup," in source
@@ -51,13 +53,14 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert 'gripper_velocity = sample_get(sample, "action.gripper_velocity")' in source
     assert 'Loaded 0 real DROID samples from all candidate repos.' in source
     assert 'DROID skip stats:' in source
-    assert 'dataset = VLADemoDataset(DEMO_DIR, image_size=IMAGE_SIZE, use_droid=USE_DROID)' in source
+    assert 'use_mujoco_demos=USE_MUJOCO_DEMOS' in source
     assert "def load_droid_task_lookup(repo_id):" not in source
     assert "def droid_cartesian_velocity_to_franka_action(" not in source
     assert "def droid_action_to_franka_action(action, source_name=" not in source
     assert 'Simulated loading' not in source
     assert 'physical-intelligence/libero' not in source
     assert "Could not find any training samples." in source
+    assert "MuJoCo demos disabled; training with DROID-only data." in source
 
 
 def test_openvla_notebook_uses_vision_model_fallback_and_real_demo_key():

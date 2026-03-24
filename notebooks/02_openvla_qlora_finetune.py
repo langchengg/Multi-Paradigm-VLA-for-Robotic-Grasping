@@ -106,6 +106,9 @@ from data.droid_utils import (
 )
 
 USE_DROID = True                                # Mix in real DROID robot data from HF
+USE_MUJOCO_DEMOS = os.environ.get("VLA_USE_MUJOCO_DEMOS", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 DEMO_DIR = os.environ.get("VLA_DEMO_DIR", "/kaggle/input/vla-demos/demos")
 DROID_DATASET_REPO_CANDIDATES = [
     repo for repo in [
@@ -139,6 +142,7 @@ print(f"   LoRA rank: {LORA_RANK}, effective batch: {BATCH_SIZE * GRAD_ACCUM_STE
 print(f"   Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 print(f"   GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
 print(f"   Log every {LOG_STEPS} optimizer steps")
+print(f"   MuJoCo demos: {'enabled' if USE_MUJOCO_DEMOS else 'disabled'}")
 print(f"   Demo dir hint: {DEMO_DIR}")
 print(
     f"   DROID: {'enabled' if USE_DROID else 'disabled'}"
@@ -289,6 +293,9 @@ import glob
 
 def resolve_demo_dir(preferred_dir):
     """Find the first directory that actually contains demo_*.npz files."""
+    if not USE_MUJOCO_DEMOS:
+        return None
+
     candidates = []
     seen = set()
 
@@ -333,15 +340,18 @@ class VLADemoDataset(Dataset):
     [dx, dy, dz, 0, 0, 0, gripper]
     """
 
-    def __init__(self, demo_dir, image_size=224, augment=True, use_droid=False):
+    def __init__(self, demo_dir, image_size=224, augment=True, use_droid=False, use_mujoco_demos=True):
         self.image_size = image_size
         self.augment = augment
         self.source_counts = {}
-        self.demo_dir = resolve_demo_dir(demo_dir)
+        self.use_mujoco_demos = use_mujoco_demos
+        self.demo_dir = resolve_demo_dir(demo_dir) if use_mujoco_demos else None
 
         # Load all self-collected demos (MuJoCo)
         self.samples = []
-        if self.demo_dir is not None:
+        if not self.use_mujoco_demos:
+            print("  MuJoCo demos disabled; training with DROID-only data.")
+        elif self.demo_dir is not None:
             demo_files = sorted(glob.glob(os.path.join(self.demo_dir, "demo_*.npz")))
             for f in demo_files:
                 data = np.load(f, allow_pickle=True)
@@ -492,12 +502,18 @@ class VLADemoDataset(Dataset):
                 print(f"  ⚠️ Failed to load DROID dataset: {type(exc).__name__}: {exc}")
 
         if len(self.samples) == 0:
+            guidance = (
+                "Enable DROID loading, or attach Notebook 1 demos as a Kaggle Dataset, "
+                "or set VLA_DEMO_DIR to a directory containing demo_*.npz files."
+                if self.use_mujoco_demos
+                else "Pure-DROID mode is enabled, so at least one real DROID sample must load."
+            )
             raise RuntimeError(
                 "Could not find any training samples. "
                 f"Tried DEMO_DIR={demo_dir!r}, resolved demo dir={self.demo_dir!r}, "
+                f"MuJoCo demos={'enabled' if self.use_mujoco_demos else 'disabled'}, "
                 f"and DROID={'enabled' if use_droid else 'disabled'}. "
-                "Attach the Notebook 1 demos as a Kaggle Dataset or set VLA_DEMO_DIR "
-                "to a directory containing demo_*.npz files."
+                f"{guidance}"
             )
 
     def __len__(self):
@@ -537,7 +553,12 @@ def collate_vla_batch(batch):
 
 
 # Test dataset
-dataset = VLADemoDataset(DEMO_DIR, image_size=IMAGE_SIZE, use_droid=USE_DROID)
+dataset = VLADemoDataset(
+    DEMO_DIR,
+    image_size=IMAGE_SIZE,
+    use_droid=USE_DROID,
+    use_mujoco_demos=USE_MUJOCO_DEMOS,
+)
 print(f"  Total Dataset size: {len(dataset)} samples")
 print(f"  Source counts: {dataset.source_counts}")
 sample = dataset[0]

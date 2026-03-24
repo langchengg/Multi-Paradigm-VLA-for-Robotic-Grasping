@@ -8,6 +8,7 @@ Single-entry orchestration for the full Kaggle training workflow:
 
 This keeps everything inside one Kaggle session so intermediate outputs are reused
 from /kaggle/working without manually publishing them as Kaggle Datasets.
+Pass --droid-only to skip Step 1 and train/evaluate from DROID only.
 """
 
 import argparse
@@ -88,7 +89,7 @@ def cleanup_after_openvla_step(working_root=Path("/kaggle/working"), home_dir=Pa
     print(f"Reclaimed approximately {reclaimed_bytes / 1024 / 1024 / 1024:.2f} GB")
 
 
-def build_pipeline_steps(project_root):
+def build_pipeline_steps(project_root, droid_only=False):
     """Return the ordered Kaggle workflow with the env overrides each step needs."""
     working_root = Path("/kaggle/working")
     return [
@@ -101,7 +102,11 @@ def build_pipeline_steps(project_root):
         {
             "name": "Notebook 2: Fine-tune OpenVLA",
             "script": project_root / "notebooks" / "02_openvla_qlora_finetune.py",
-            "env": {"VLA_DEMO_DIR": str(working_root / "demos")},
+            "env": (
+                {"VLA_USE_MUJOCO_DEMOS": "0"}
+                if droid_only
+                else {"VLA_DEMO_DIR": str(working_root / "demos")}
+            ),
             "outputs": [working_root / "openvla-finetuned" / "final"],
             "post_run": cleanup_after_openvla_step,
         },
@@ -171,10 +176,22 @@ def main():
         action="store_true",
         help="Disable the low-disk cleanup that normally runs after Notebook 2.",
     )
+    parser.add_argument(
+        "--droid-only",
+        action="store_true",
+        help="Skip MuJoCo demo collection and run Notebook 2 in pure-DROID mode.",
+    )
     args = parser.parse_args()
 
-    steps = build_pipeline_steps(PROJECT_ROOT)
+    steps = build_pipeline_steps(PROJECT_ROOT, droid_only=args.droid_only)
     selected_indices = parse_steps_arg(args.steps, len(steps))
+    if args.droid_only:
+        if args.steps.strip().lower() == "all":
+            selected_indices = [1, 2]
+        elif 0 in selected_indices:
+            raise ValueError(
+                "--droid-only skips Notebook 1. Use '--steps 2,3' or omit --steps."
+            )
 
     print("=" * 78)
     print("Kaggle End-to-End VLA Pipeline")
@@ -182,6 +199,7 @@ def main():
     print(f"Project root: {PROJECT_ROOT}")
     print(f"Selected steps: {[index + 1 for index in selected_indices]}")
     print("This mode reuses /kaggle/working outputs and avoids manual Dataset publishing.")
+    print(f"DROID-only mode: {'on' if args.droid_only else 'off'}")
     print(f"Low-disk cleanup after Notebook 2: {'off' if args.keep_intermediates else 'on'}")
 
     total_start = time.time()

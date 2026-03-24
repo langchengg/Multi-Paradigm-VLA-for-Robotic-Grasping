@@ -63,6 +63,12 @@ This single entry point runs Notebook 1 → Notebook 2 → Notebook 3 in order a
 - `/kaggle/working/openvla-finetuned/final`
 - `/kaggle/working/results`
 
+To skip MuJoCo demo collection and train/evaluate from DROID only:
+
+```bash
+python scripts/run_kaggle_pipeline.py --droid-only
+```
+
 Manual split mode is still supported. Use this fixed order if you want separate Kaggle notebooks:
 
 1. `notebooks/01_env_setup_and_demo.py`
@@ -337,7 +343,7 @@ If you prefer separate notebooks, run the 3 notebook scripts in order:
 | 5c | `notebooks/03_flow_matching_eval.py` | ~45-90 min | T4 required |
 
 **Notebook 1** → Collects 100 expert demos in MuJoCo into `/kaggle/working/demos`  
-**Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA on MuJoCo demos + DROID real-robot data  
+**Notebook 2** → Fine-tunes OpenVLA-7B with QLoRA on MuJoCo demos + DROID real-robot data, or pure DROID with `VLA_USE_MUJOCO_DEMOS=0` / `--droid-only`  
 **Notebook 3** → Trains lightweight FlowMatching/Diffusion VLAs + held-out DROID offline eval
 
 If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The install cells in Notebook 2 and 3 do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.

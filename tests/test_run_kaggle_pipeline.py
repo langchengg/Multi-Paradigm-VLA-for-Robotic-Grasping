@@ -24,6 +24,14 @@ def test_build_pipeline_steps_uses_same_session_working_outputs():
     assert str(steps[2]["outputs"][0]).endswith("/kaggle/working/results/real_offline_summary.json")
 
 
+def test_build_pipeline_steps_supports_droid_only_mode():
+    steps = build_pipeline_steps(ROOT, droid_only=True)
+
+    assert len(steps) == 3
+    assert steps[1]["env"]["VLA_USE_MUJOCO_DEMOS"] == "0"
+    assert "VLA_DEMO_DIR" not in steps[1]["env"]
+
+
 def test_parse_steps_arg_accepts_all_and_subsets():
     assert parse_steps_arg("all", 3) == [0, 1, 2]
     assert parse_steps_arg("1,3", 3) == [0, 2]
