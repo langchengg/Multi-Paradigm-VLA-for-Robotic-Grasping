@@ -27,7 +27,9 @@ def test_openvla_notebook_loads_real_data_from_droid():
     source = notebook_path.read_text()
 
     assert 'USE_DROID = True' in source
-    assert 'DROID_DATASET_REPO = "cadene/droid_1.0.1_v30"' in source
+    assert 'DROID_DATASET_REPO_CANDIDATES = [' in source
+    assert '"cadene/droid"' in source
+    assert '"cadene/droid_1.0.1_v30"' in source
     assert "DROID_MAX_SAMPLES = 500" in source
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
     assert "NUM_EPOCHS = 1" in source
@@ -42,6 +44,8 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert 'cartesian_velocity = sample_get(sample, "action.cartesian_velocity")' in source
     assert 'gripper_position = sample_get(sample, "action.gripper_position")' in source
     assert 'gripper_velocity = sample_get(sample, "action.gripper_velocity")' in source
+    assert 'Loaded 0 real DROID samples from all candidate repos.' in source
+    assert 'DROID skip stats:' in source
     assert 'dataset = VLADemoDataset(DEMO_DIR, image_size=IMAGE_SIZE, use_droid=USE_DROID)' in source
     assert "def load_droid_task_lookup(repo_id):" not in source
     assert "def droid_cartesian_velocity_to_franka_action(" not in source
@@ -60,6 +64,8 @@ def test_openvla_notebook_uses_vision_model_fallback_and_real_demo_key():
     assert "AutoModelForVision2Seq as OpenVLAModelClass" in source
     assert "AutoModelForImageTextToText as OpenVLAModelClass" in source
     assert 'model = OpenVLAModelClass.from_pretrained(' in source
+    assert 'model_kwargs["device_map"] = {"": 0}' in source
+    assert 'device_map="auto"' not in source
     assert 'instructions = data["instructions"]' in source
     assert 'data["instruction"]' not in source
 

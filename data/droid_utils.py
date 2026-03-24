@@ -9,8 +9,11 @@ These helpers keep Notebook 2 and Notebook 3 aligned on the same:
 
 import io
 import json
+from collections import OrderedDict
+from functools import lru_cache
 
 import numpy as np
+import pyarrow.parquet as pq
 from PIL import Image
 
 
@@ -22,10 +25,16 @@ GRIPPER_CLOSE_VALUE = 1.0
 ACTION_MIN = -1.0
 ACTION_MAX = 1.0
 DROID_DEFAULT_FPS = 15.0
+DROID_CAMERA_KEYS = (
+    "observation.images.exterior_1_left",
+    "observation.images.exterior_2_left",
+    "observation.images.wrist_left",
+)
 
 __all__ = [
     "ACTION_MAX",
     "ACTION_MIN",
+    "DROID_CAMERA_KEYS",
     "DROID_DEFAULT_FPS",
     "FRANKA_ACTION_KEYS",
     "GRIPPER_CLOSE_VALUE",
@@ -37,6 +46,8 @@ __all__ = [
     "ensure_franka_action_7d",
     "gripper_value_to_binary_command",
     "image_to_uint8_array",
+    "iter_droid_v30_stream",
+    "load_droid_info",
     "load_droid_task_lookup",
     "sample_get",
 ]
@@ -258,3 +269,191 @@ def load_droid_task_lookup(repo_id):
                 record = json.loads(line)
                 task_lookup[int(record["task_index"])] = record["task"]
     return task_lookup
+
+
+@lru_cache(maxsize=4)
+def load_droid_info(repo_id):
+    """Load DROID dataset metadata required to resolve video-backed image streams."""
+    from huggingface_hub import hf_hub_download
+
+    info_path = hf_hub_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        filename="meta/info.json",
+    )
+    with open(info_path, "r") as f:
+        return json.load(f)
+
+
+@lru_cache(maxsize=4)
+def _list_droid_data_files(repo_id):
+    """Return sorted parquet shards for the DROID train split."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    return tuple(
+        sorted(
+            file_name
+            for file_name in api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+            if file_name.startswith("data/") and file_name.endswith(".parquet")
+        )
+    )
+
+
+@lru_cache(maxsize=16)
+def _load_droid_episode_rows(repo_id, meta_file):
+    """Load per-file episode metadata rows used to map frame rows to MP4 shards."""
+    from huggingface_hub import hf_hub_download
+
+    meta_path = hf_hub_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        filename=meta_file,
+    )
+    return tuple(pq.read_table(meta_path).to_pylist())
+
+
+class _OpenCVVideoCache:
+    """Small LRU cache for MP4 readers so DROID frame extraction stays cheap."""
+
+    def __init__(self, max_open=4):
+        self.max_open = max_open
+        self._caps = OrderedDict()
+
+    def close(self):
+        for cap in self._caps.values():
+            cap.release()
+        self._caps.clear()
+
+    def _get_cap(self, video_path):
+        import cv2
+
+        cap = self._caps.pop(video_path, None)
+        if cap is None:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                raise ValueError(f"Failed to open DROID video file: {video_path}")
+        self._caps[video_path] = cap
+        while len(self._caps) > self.max_open:
+            _, old_cap = self._caps.popitem(last=False)
+            old_cap.release()
+        return cap
+
+    def read_frame(self, video_path, frame_index):
+        import cv2
+
+        cap = self._get_cap(video_path)
+        if not cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index)):
+            raise ValueError(f"Failed to seek to frame {frame_index} in {video_path}")
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise ValueError(f"Failed to decode frame {frame_index} in {video_path}")
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def iter_droid_v30_stream(
+    repo_id,
+    *,
+    split="train",
+    max_samples=None,
+    camera_keys=DROID_CAMERA_KEYS,
+    max_open_videos=4,
+):
+    """
+    Yield DROID v3 frame rows with decoded RGB images.
+
+    The Hugging Face parquet rows do not inline video frames. Instead, each parquet
+    file has a matching `meta/episodes/...` file that tells us which MP4 shard holds
+    the frames for each episode. We walk data shards sequentially, track the local
+    episode inside the shard via `is_first`, then decode the requested frame from the
+    corresponding MP4 on demand.
+    """
+    from datasets import load_dataset
+    from huggingface_hub import hf_hub_download
+
+    if split != "train":
+        raise ValueError(f"Unsupported DROID split {split!r}; expected 'train'.")
+
+    info = load_droid_info(repo_id)
+    video_path_template = info.get("video_path")
+    if not video_path_template:
+        raise ValueError(f"DROID repo {repo_id} does not expose video_path metadata.")
+    fps = float(info.get("fps", DROID_DEFAULT_FPS))
+
+    data_files = _list_droid_data_files(repo_id)
+    if not data_files:
+        raise FileNotFoundError(f"No DROID parquet shards found in repo {repo_id}")
+
+    reader = _OpenCVVideoCache(max_open=max_open_videos)
+    yielded = 0
+
+    try:
+        for data_file in data_files:
+            meta_file = data_file.replace("data/", "meta/episodes/")
+            episode_rows = _load_droid_episode_rows(repo_id, meta_file)
+            if not episode_rows:
+                continue
+
+            local_episode_idx = -1
+            data_stream = load_dataset(
+                repo_id,
+                split=split,
+                streaming=True,
+                data_files=data_file,
+            )
+
+            for sample in data_stream:
+                if sample_get(sample, "is_first"):
+                    local_episode_idx += 1
+                if local_episode_idx < 0 or local_episode_idx >= len(episode_rows):
+                    raise IndexError(
+                        f"DROID episode pointer {local_episode_idx} is out of bounds for {meta_file}"
+                    )
+
+                episode_row = episode_rows[local_episode_idx]
+                frame_index = int(sample_get(sample, "frame_index") or 0)
+
+                image = None
+                last_error = None
+                used_camera = None
+                for camera_key in camera_keys:
+                    chunk_idx = episode_row.get(f"videos/{camera_key}/chunk_index")
+                    file_idx = episode_row.get(f"videos/{camera_key}/file_index")
+                    from_ts = episode_row.get(f"videos/{camera_key}/from_timestamp")
+                    if chunk_idx is None or file_idx is None or from_ts is None:
+                        continue
+
+                    absolute_frame = int(round(float(from_ts) * fps)) + frame_index
+                    video_file = video_path_template.format(
+                        video_key=camera_key,
+                        chunk_index=int(chunk_idx),
+                        file_index=int(file_idx),
+                    )
+                    try:
+                        local_video_path = hf_hub_download(
+                            repo_id=repo_id,
+                            repo_type="dataset",
+                            filename=video_file,
+                        )
+                        image = reader.read_frame(local_video_path, absolute_frame)
+                        used_camera = camera_key
+                        break
+                    except Exception as exc:
+                        last_error = exc
+
+                if image is None:
+                    raise ValueError(
+                        f"Could not decode any DROID camera frame for {repo_id}:{data_file}:"
+                        f"{local_episode_idx}:{frame_index}"
+                    ) from last_error
+
+                out = dict(sample)
+                out["observation.images.active_camera"] = used_camera
+                out["decoded_image"] = image
+                yield out
+                yielded += 1
+
+                if max_samples is not None and yielded >= max_samples:
+                    return
+    finally:
+        reader.close()

@@ -58,6 +58,7 @@ def install():
     pkgs = [
         "torch==2.2.0",
         "torchvision==0.17.0",
+        "opencv-python-headless>=4.9.0",
         "transformers==4.40.1",
         "tokenizers==0.19.1",
         "accelerate==0.30.1",
@@ -105,6 +106,8 @@ from data.droid_utils import (
     droid_cartesian_velocity_to_franka_action,
     ensure_franka_action_7d,
     image_to_uint8_array,
+    iter_droid_v30_stream,
+    load_droid_info,
     load_droid_task_lookup,
     sample_get,
 )
@@ -126,7 +129,6 @@ DROID_DATASET_REPO_CANDIDATES = [
     repo for repo in [
         os.environ.get("DROID_DATASET_REPO", "").strip() or None,
         "cadene/droid_1.0.1_v30",
-        "cadene/droid",
     ]
     if repo
 ]
@@ -221,100 +223,125 @@ def save_json(path, payload):
 
 def load_real_droid_records(max_samples):
     """Materialize a manageable subset of held-out real DROID frames into memory."""
-    from datasets import load_dataset
-
     repo_id = None
-    dataset_stream = None
-    task_lookup = {}
+    records = []
     last_exc = None
-
+    skip_stats = {}
     for candidate in DROID_DATASET_REPO_CANDIDATES:
         try:
             task_lookup = load_droid_task_lookup(candidate)
-            dataset_stream = load_dataset(candidate, split=DROID_SPLIT, streaming=True)
-            repo_id = candidate
-            break
+            droid_info = load_droid_info(candidate)
         except Exception as exc:
             last_exc = exc
-
-    if dataset_stream is None:
-        raise RuntimeError(
-            "Failed to load a DROID dataset repo. Tried: "
-            + ", ".join(DROID_DATASET_REPO_CANDIDATES)
-        ) from last_exc
-
-    records = []
-    for idx, sample in enumerate(dataset_stream):
-        success = sample_get(sample, "is_episode_successful")
-        if success is False:
+            skip_stats[candidate] = {"load_error": f"{type(exc).__name__}: {exc}"}
             continue
 
-        image = sample_get(
-            sample,
-            "observation.images.exterior_1_left",
-            "observation.images.exterior_image_1_left",
-            "observation.images.exterior_2_left",
-            "observation.images.exterior_image_2_left",
-            "observation.images.wrist_left",
-            "observation.images.wrist_image_left",
-        )
-        instruction = sample_get(
-            sample,
-            "language_instruction",
-            "language_instruction_2",
-            "language_instruction_3",
-        )
-        if instruction is None:
-            task_index = sample_get(sample, "task_index")
-            if task_index is not None:
-                instruction = task_lookup.get(int(task_index))
-        if isinstance(instruction, str) and not instruction.strip():
-            instruction = None
+        candidate_skip_stats = {
+            "unsuccessful": 0,
+            "missing_image": 0,
+            "missing_instruction": 0,
+            "missing_action": 0,
+            "bad_image": 0,
+            "bad_action": 0,
+        }
 
-        raw_action = sample_get(sample, "action.original", "action")
-        cartesian_velocity = sample_get(sample, "action.cartesian_velocity")
-        gripper_position = sample_get(sample, "action.gripper_position")
-        gripper_velocity = sample_get(sample, "action.gripper_velocity")
-
-        if image is None or instruction is None:
-            continue
-
-        source_name = f"{repo_id}:{idx}"
-        if cartesian_velocity is not None:
-            action_7d = droid_cartesian_velocity_to_franka_action(
-                cartesian_velocity,
-                gripper_position=gripper_position,
-                gripper_velocity=gripper_velocity,
-                source_name=source_name,
+        for idx, sample in enumerate(
+            iter_droid_v30_stream(
+                candidate,
+                split=DROID_SPLIT,
+                max_samples=max_samples,
             )
-        elif raw_action is not None:
-            action_7d = droid_action_to_franka_action(raw_action, source_name=source_name)
-        else:
-            continue
+        ):
+            success = sample_get(sample, "is_episode_successful")
+            if success is False:
+                candidate_skip_stats["unsuccessful"] += 1
+                continue
 
-        episode_index = sample_get(sample, "episode_index")
-        if episode_index is None:
-            episode_index = int(idx)
-        frame_index = sample_get(sample, "frame_index")
-        if frame_index is None:
-            frame_index = 0
+            image = sample_get(sample, "decoded_image")
+            if image is None:
+                candidate_skip_stats["missing_image"] += 1
+                continue
 
-        records.append({
-            "image": image_to_uint8_array(image, source_name),
-            "instruction": str(instruction),
-            "action_7d": action_7d,
-            "episode_index": int(np.asarray(episode_index).reshape(-1)[0]),
-            "frame_index": int(np.asarray(frame_index).reshape(-1)[0]),
-            "source": "droid",
-            "sample_index": idx,
-        })
-        if len(records) >= max_samples:
+            instruction = sample_get(
+                sample,
+                "language_instruction",
+                "language_instruction_2",
+                "language_instruction_3",
+            )
+            if instruction is None:
+                task_index = sample_get(sample, "task_index")
+                if task_index is not None:
+                    instruction = task_lookup.get(int(task_index))
+            if isinstance(instruction, str) and not instruction.strip():
+                instruction = None
+            if instruction is None:
+                candidate_skip_stats["missing_instruction"] += 1
+                continue
+
+            raw_action = sample_get(sample, "action.original", "action")
+            cartesian_velocity = sample_get(sample, "action.cartesian_velocity")
+            gripper_position = sample_get(sample, "action.gripper_position")
+            gripper_velocity = sample_get(sample, "action.gripper_velocity")
+            if cartesian_velocity is None and raw_action is None:
+                candidate_skip_stats["missing_action"] += 1
+                continue
+
+            source_name = f"{candidate}:{idx}"
+            try:
+                if cartesian_velocity is not None:
+                    action_7d = droid_cartesian_velocity_to_franka_action(
+                        cartesian_velocity,
+                        gripper_position=gripper_position,
+                        gripper_velocity=gripper_velocity,
+                        source_name=source_name,
+                    )
+                else:
+                    action_7d = droid_action_to_franka_action(raw_action, source_name=source_name)
+            except Exception:
+                candidate_skip_stats["bad_action"] += 1
+                continue
+
+            try:
+                image_arr = image_to_uint8_array(image, source_name)
+            except Exception:
+                candidate_skip_stats["bad_image"] += 1
+                continue
+
+            episode_index = sample_get(sample, "episode_index")
+            if episode_index is None:
+                episode_index = int(idx)
+            frame_index = sample_get(sample, "frame_index")
+            if frame_index is None:
+                frame_index = 0
+
+            records.append({
+                "image": image_arr,
+                "instruction": str(instruction),
+                "action_7d": action_7d,
+                "episode_index": int(np.asarray(episode_index).reshape(-1)[0]),
+                "frame_index": int(np.asarray(frame_index).reshape(-1)[0]),
+                "source": "droid",
+                "sample_index": idx,
+            })
+            repo_id = candidate
+            if len(records) >= max_samples:
+                break
+
+        skip_stats[candidate] = candidate_skip_stats
+        if records:
             break
 
     if not records:
-        raise RuntimeError("No usable DROID samples were loaded for offline evaluation.")
+        raise RuntimeError(
+            "No usable DROID samples were loaded for offline evaluation. "
+            f"Skip stats: {skip_stats}"
+        ) from last_exc
 
-    print(f"✅ Loaded {len(records)} real DROID frames from {repo_id}")
+    print(
+        f"✅ Loaded {len(records)} real DROID frames from {repo_id} "
+        f"at {droid_info.get('fps', DROID_FPS)} Hz"
+    )
+    print(f"   DROID skip stats: {skip_stats}")
     return repo_id, records
 
 
@@ -759,7 +786,7 @@ class OpenVLAPolicyWrapper:
         if torch.cuda.is_available():
             model_kwargs["quantization_config"] = bnb_config
             model_kwargs["torch_dtype"] = torch.float16
-            model_kwargs["device_map"] = "auto"
+            model_kwargs["device_map"] = {"": 0}
         else:
             model_kwargs["torch_dtype"] = torch.float32
 

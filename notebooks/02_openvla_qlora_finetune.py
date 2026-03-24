@@ -55,6 +55,7 @@ def install():
         # Official OpenVLA-compatible stack
         "torch==2.2.0",
         "torchvision==0.17.0",
+        "opencv-python-headless>=4.9.0",
         "transformers==4.40.1",
         "tokenizers==0.19.1",
         "accelerate==0.30.1",
@@ -96,13 +97,21 @@ from data.droid_utils import (
     droid_cartesian_velocity_to_franka_action,
     ensure_franka_action_7d,
     image_to_uint8_array,
+    iter_droid_v30_stream,
     load_droid_task_lookup,
+    load_droid_info,
     sample_get,
 )
 
 USE_DROID = True                                # Mix in real DROID robot data from HF
 DEMO_DIR = os.environ.get("VLA_DEMO_DIR", "/kaggle/input/vla-demos/demos")
-DROID_DATASET_REPO = "cadene/droid_1.0.1_v30"
+DROID_DATASET_REPO_CANDIDATES = [
+    repo for repo in [
+        os.environ.get("DROID_DATASET_REPO", "").strip() or None,
+        "cadene/droid_1.0.1_v30",
+    ]
+    if repo
+]
 DROID_SPLIT = "train"
 DROID_MAX_SAMPLES = 500                         # lower the real-data mix for low-disk Kaggle runs
 DROID_FPS = DROID_DEFAULT_FPS                   # keep one shared control-rate assumption
@@ -131,7 +140,7 @@ print(f"   Log every {LOG_STEPS} optimizer steps")
 print(f"   Demo dir hint: {DEMO_DIR}")
 print(
     f"   DROID: {'enabled' if USE_DROID else 'disabled'}"
-    + (f" ({DROID_DATASET_REPO}, max {DROID_MAX_SAMPLES} samples)" if USE_DROID else "")
+    + (f" ({DROID_DATASET_REPO_CANDIDATES}, max {DROID_MAX_SAMPLES} samples)" if USE_DROID else "")
 )
 if USE_DROID:
     print(f"   DROID control rate assumption: {DROID_FPS:g} Hz")
@@ -359,83 +368,116 @@ class VLADemoDataset(Dataset):
 
         # Load real DROID dataset from HuggingFace
         if use_droid and DROID_MAX_SAMPLES > 0:
-            print(
-                f"  Streaming up to {DROID_MAX_SAMPLES} real DROID samples "
-                f"from {DROID_DATASET_REPO}..."
-            )
             try:
-                from datasets import load_dataset
-                task_lookup = load_droid_task_lookup(DROID_DATASET_REPO)
-                droid_ds = load_dataset(
-                    DROID_DATASET_REPO,
-                    split=DROID_SPLIT,
-                    streaming=True,
-                )
-
                 droid_count = 0
-                for idx, sample in enumerate(droid_ds):
-                    success = sample_get(sample, "is_episode_successful")
-                    if success is False:
-                        continue
-                    image = sample_get(
-                        sample,
-                        "observation.images.exterior_1_left",
-                        "observation.images.exterior_image_1_left",
-                        "observation.images.exterior_2_left",
-                        "observation.images.exterior_image_2_left",
-                        "observation.images.wrist_left",
-                        "observation.images.wrist_image_left",
+                droid_repo = None
+                skip_stats = {}
+
+                for candidate in DROID_DATASET_REPO_CANDIDATES:
+                    print(
+                        f"  Streaming up to {DROID_MAX_SAMPLES} real DROID samples "
+                        f"from {candidate}..."
                     )
-                    instruction = sample_get(
-                        sample,
-                        "language_instruction",
-                        "language_instruction_2",
-                        "language_instruction_3",
-                    )
-                    if instruction is None:
-                        task_index = sample_get(sample, "task_index")
-                        if task_index is not None:
-                            instruction = task_lookup.get(int(task_index))
-                    if isinstance(instruction, str) and not instruction.strip():
-                        instruction = None
+                    task_lookup = load_droid_task_lookup(candidate)
+                    droid_info = load_droid_info(candidate)
+                    candidate_skip_stats = {
+                        "unsuccessful": 0,
+                        "missing_image": 0,
+                        "missing_instruction": 0,
+                        "missing_action": 0,
+                        "bad_image": 0,
+                        "bad_action": 0,
+                    }
 
-                    raw_action = sample_get(sample, "action.original", "action")
-                    cartesian_velocity = sample_get(sample, "action.cartesian_velocity")
-                    gripper_position = sample_get(sample, "action.gripper_position")
-                    gripper_velocity = sample_get(sample, "action.gripper_velocity")
-
-                    if image is None or instruction is None:
-                        continue
-
-                    if cartesian_velocity is not None:
-                        action_7d = droid_cartesian_velocity_to_franka_action(
-                            cartesian_velocity,
-                            gripper_position=gripper_position,
-                            gripper_velocity=gripper_velocity,
-                            source_name=f"{DROID_DATASET_REPO}:{idx}",
+                    for idx, sample in enumerate(
+                        iter_droid_v30_stream(
+                            candidate,
+                            split=DROID_SPLIT,
+                            max_samples=DROID_MAX_SAMPLES,
                         )
-                    elif raw_action is not None:
-                        action_7d = droid_action_to_franka_action(
-                            raw_action,
-                            source_name=f"{DROID_DATASET_REPO}:{idx}",
+                    ):
+                        success = sample_get(sample, "is_episode_successful")
+                        if success is False:
+                            candidate_skip_stats["unsuccessful"] += 1
+                            continue
+
+                        image = sample_get(sample, "decoded_image")
+                        if image is None:
+                            candidate_skip_stats["missing_image"] += 1
+                            continue
+
+                        instruction = sample_get(
+                            sample,
+                            "language_instruction",
+                            "language_instruction_2",
+                            "language_instruction_3",
                         )
-                    else:
-                        continue
-                    self.samples.append({
-                        "image": image_to_uint8_array(image, f"{DROID_DATASET_REPO}:{idx}"),
-                        "instruction": str(instruction),
-                        "action_7d": action_7d,
-                        "source": "droid",
-                    })
-                    droid_count += 1
-                    if droid_count >= DROID_MAX_SAMPLES:
+                        if instruction is None:
+                            task_index = sample_get(sample, "task_index")
+                            if task_index is not None:
+                                instruction = task_lookup.get(int(task_index))
+                        if isinstance(instruction, str) and not instruction.strip():
+                            instruction = None
+                        if instruction is None:
+                            candidate_skip_stats["missing_instruction"] += 1
+                            continue
+
+                        raw_action = sample_get(sample, "action.original", "action")
+                        cartesian_velocity = sample_get(sample, "action.cartesian_velocity")
+                        gripper_position = sample_get(sample, "action.gripper_position")
+                        gripper_velocity = sample_get(sample, "action.gripper_velocity")
+                        if cartesian_velocity is None and raw_action is None:
+                            candidate_skip_stats["missing_action"] += 1
+                            continue
+
+                        source_name = f"{candidate}:{idx}"
+                        try:
+                            if cartesian_velocity is not None:
+                                action_7d = droid_cartesian_velocity_to_franka_action(
+                                    cartesian_velocity,
+                                    gripper_position=gripper_position,
+                                    gripper_velocity=gripper_velocity,
+                                    source_name=source_name,
+                                )
+                            else:
+                                action_7d = droid_action_to_franka_action(
+                                    raw_action,
+                                    source_name=source_name,
+                                )
+                        except Exception:
+                            candidate_skip_stats["bad_action"] += 1
+                            continue
+
+                        try:
+                            image_arr = image_to_uint8_array(image, source_name)
+                        except Exception:
+                            candidate_skip_stats["bad_image"] += 1
+                            continue
+
+                        self.samples.append({
+                            "image": image_arr,
+                            "instruction": str(instruction),
+                            "action_7d": action_7d,
+                            "source": "droid",
+                        })
+                        droid_count += 1
+                        droid_repo = candidate
+                        if droid_count >= DROID_MAX_SAMPLES:
+                            break
+
+                    skip_stats[candidate] = candidate_skip_stats
+                    if droid_count > 0:
                         break
 
                 self.source_counts["droid"] = droid_count
-                print(
-                    f"  Loaded {droid_count} real DROID samples "
-                    f"from {DROID_DATASET_REPO}/{DROID_SPLIT}"
-                )
+                if droid_count > 0:
+                    print(
+                        f"  Loaded {droid_count} real DROID samples "
+                        f"from {droid_repo}/{DROID_SPLIT} at {droid_info.get('fps', DROID_FPS)} Hz"
+                    )
+                else:
+                    print("  Loaded 0 real DROID samples from all candidate repos.")
+                print(f"  DROID skip stats: {skip_stats}")
             except Exception as exc:
                 print(f"  ⚠️ Failed to load DROID dataset: {type(exc).__name__}: {exc}")
 
@@ -517,14 +559,19 @@ bnb_config = BitsAndBytesConfig(
 )
 
 # Load model
-model = OpenVLAModelClass.from_pretrained(
-    MODEL_NAME,
-    quantization_config=bnb_config,
-    torch_dtype=torch.float16,
-    device_map="auto",
-    trust_remote_code=True,
-    low_cpu_mem_usage=True,
-)
+model_kwargs = {
+    "quantization_config": bnb_config,
+    "torch_dtype": torch.float16,
+    "trust_remote_code": True,
+    "low_cpu_mem_usage": True,
+}
+if torch.cuda.is_available():
+    # Avoid automatic CPU offload; partial CPU placement makes 7B training extremely slow.
+    model_kwargs["device_map"] = {"": 0}
+else:
+    model_kwargs["device_map"] = "cpu"
+
+model = OpenVLAModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
 
 # Load processor
 processor = AutoProcessor.from_pretrained(
@@ -533,7 +580,9 @@ processor = AutoProcessor.from_pretrained(
 )
 
 print(f"✅ Model loaded on {next(model.parameters()).device}")
-print(f"   Memory: {torch.cuda.memory_allocated()/1e9:.1f} GB")
+if torch.cuda.is_available():
+    print(f"   Memory allocated: {torch.cuda.memory_allocated()/1e9:.1f} GB")
+    print(f"   Memory reserved: {torch.cuda.memory_reserved()/1e9:.1f} GB")
 
 # Prepare for QLoRA training
 model = prepare_model_for_kbit_training(model)
