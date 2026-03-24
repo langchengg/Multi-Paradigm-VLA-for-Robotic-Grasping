@@ -113,7 +113,7 @@ def build_pipeline_steps(project_root, droid_only=False):
         {
             "name": "Notebook 3: Train baselines + offline DROID eval",
             "script": project_root / "notebooks" / "03_flow_matching_eval.py",
-            "env": {},
+            "env": {"VLA_SKIP_INSTALL": "1"},
             "outputs": [working_root / "results" / "real_offline_summary.json"],
         },
     ]

@@ -30,6 +30,7 @@ def test_build_pipeline_steps_supports_droid_only_mode():
     assert len(steps) == 3
     assert steps[1]["env"]["VLA_USE_MUJOCO_DEMOS"] == "0"
     assert "VLA_DEMO_DIR" not in steps[1]["env"]
+    assert steps[2]["env"]["VLA_SKIP_INSTALL"] == "1"
 
 
 def test_parse_steps_arg_accepts_all_and_subsets():

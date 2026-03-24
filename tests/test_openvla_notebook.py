@@ -33,6 +33,7 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert "DROID_MAX_SAMPLES = 500" in source
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
     assert "NUM_EPOCHS = 1" in source
+    assert '"av>=12.0.0"' in source
     assert '"opencv-python-headless>=4.9.0"' in source
     assert '"imageio-ffmpeg>=0.4.9"' in source
     assert "from data.droid_utils import (" in source

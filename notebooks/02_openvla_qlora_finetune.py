@@ -55,6 +55,7 @@ def install():
         # Official OpenVLA-compatible stack
         "torch==2.2.0",
         "torchvision==0.17.0",
+        "av>=12.0.0",
         "opencv-python-headless>=4.9.0",
         "imageio>=2.30.0",
         "imageio-ffmpeg>=0.4.9",

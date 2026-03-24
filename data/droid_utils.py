@@ -326,10 +326,14 @@ class _OpenCVVideoCache:
 
     def __init__(self, max_open=4):
         self.max_open = max_open
+        self._pyav_states = OrderedDict()
         self._caps = OrderedDict()
         self._imageio_readers = OrderedDict()
 
     def close(self):
+        for state in self._pyav_states.values():
+            state["container"].close()
+        self._pyav_states.clear()
         for cap in self._caps.values():
             cap.release()
         self._caps.clear()
@@ -355,6 +359,11 @@ class _OpenCVVideoCache:
         import cv2
 
         errors = {}
+
+        try:
+            return self._read_frame_pyav(video_path, frame_index)
+        except Exception as exc:
+            errors["pyav"] = f"{type(exc).__name__}: {exc}"
 
         cap = self._get_cap(video_path)
         try:
@@ -396,6 +405,37 @@ class _OpenCVVideoCache:
                 f"ImageIO returned frame with shape {frame.shape} for {video_path}:{frame_index}"
             )
         return frame
+
+    def _get_pyav_state(self, video_path, frame_index):
+        import av
+
+        state = self._pyav_states.pop(video_path, None)
+        if state is None or int(frame_index) < state["next_index"]:
+            if state is not None:
+                state["container"].close()
+            container = av.open(video_path)
+            stream = container.streams.video[0]
+            state = {
+                "container": container,
+                "frames": container.decode(stream),
+                "next_index": 0,
+            }
+        self._pyav_states[video_path] = state
+        while len(self._pyav_states) > self.max_open:
+            _, old_state = self._pyav_states.popitem(last=False)
+            old_state["container"].close()
+        return state
+
+    def _read_frame_pyav(self, video_path, frame_index):
+        state = self._get_pyav_state(video_path, frame_index)
+        target = int(frame_index)
+        while state["next_index"] <= target:
+            frame = next(state["frames"])
+            current = state["next_index"]
+            state["next_index"] += 1
+            if current == target:
+                return frame.to_ndarray(format="rgb24")
+        raise ValueError(f"PyAV could not reach frame {frame_index} in {video_path}")
 
 
 def iter_droid_v30_stream(

@@ -39,6 +39,9 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert 'DROID_EVAL_FRACTION = 0.2' in source
     assert 'DROID_FPS = DROID_DEFAULT_FPS' in source
     assert 'ACTION_HORIZON = 1' in source
+    assert 'VLA_SKIP_INSTALL' in source
+    assert 'skipped dependency installation' in source
+    assert '"av>=12.0.0"' in source
     assert '"opencv-python-headless>=4.9.0"' in source
     assert '"imageio-ffmpeg>=0.4.9"' in source
     assert "from data.droid_utils import (" in source
@@ -60,6 +63,10 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert 'train_records, eval_records = split_records_by_episode(all_droid_records, DROID_EVAL_FRACTION)' in source
     assert "class DiffusionVLA(nn.Module):" in source
     assert "class OpenVLAPolicyWrapper:" in source
+    assert "self.input_dtype = torch.float32" in source
+    assert "self.input_dtype = next(self.model.parameters()).dtype" in source
+    assert "if torch.is_floating_point(value):" in source
+    assert "dtype=self.input_dtype" in source
     assert "VLAMuJoCoEvaluator" not in source
     assert "FrankaGraspEnv" not in source
     assert 'comparison["autoregressive"] = evaluate_policy_offline("autoregressive", openvla_policy, eval_records)' in source

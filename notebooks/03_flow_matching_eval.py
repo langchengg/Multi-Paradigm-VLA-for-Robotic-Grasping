@@ -55,9 +55,15 @@ def verify_torch_numpy_bridge():
 
 
 def install():
+    if os.environ.get("VLA_SKIP_INSTALL", "").strip().lower() in {"1", "true", "yes", "on"}:
+        verify_torch_numpy_bridge()
+        print("✅ Reusing existing environment; skipped dependency installation")
+        return
+
     pkgs = [
         "torch==2.2.0",
         "torchvision==0.17.0",
+        "av>=12.0.0",
         "opencv-python-headless>=4.9.0",
         "transformers==4.40.1",
         "tokenizers==0.19.1",
@@ -773,6 +779,7 @@ class OpenVLAPolicyWrapper:
         self.model = None
         self.processor = None
         self.input_device = torch.device(DEVICE)
+        self.input_dtype = torch.float32
 
     def _load(self):
         if self.adapter_dir is None:
@@ -804,6 +811,7 @@ class OpenVLAPolicyWrapper:
         self.processor = AutoProcessor.from_pretrained(self.adapter_dir, trust_remote_code=True)
         self.model.eval()
         self.input_device = next(self.model.parameters()).device
+        self.input_dtype = next(self.model.parameters()).dtype
 
     @torch.no_grad()
     def predict_action(self, image_np, instruction):
@@ -813,7 +821,13 @@ class OpenVLAPolicyWrapper:
         prompt = format_vla_prompt(instruction)
         img = Image.fromarray(image_np)
         inputs = self.processor(images=[img], text=[prompt], return_tensors="pt")
-        inputs = {k: v.to(self.input_device) for k, v in inputs.items()}
+        prepared_inputs = {}
+        for key, value in inputs.items():
+            if torch.is_floating_point(value):
+                prepared_inputs[key] = value.to(device=self.input_device, dtype=self.input_dtype)
+            else:
+                prepared_inputs[key] = value.to(self.input_device)
+        inputs = prepared_inputs
 
         sync_cuda()
         start = time.time()
