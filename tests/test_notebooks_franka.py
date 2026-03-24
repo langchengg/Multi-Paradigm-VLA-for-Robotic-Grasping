@@ -34,7 +34,7 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "def verify_torch_numpy_bridge():" in source
     assert "torch.tensor([1.0]).numpy()" in source
     assert 'DROID_DATASET_REPO_CANDIDATES = [' in source
-    assert 'DROID_MAX_SAMPLES = 1000' in source
+    assert 'DROID_MAX_SAMPLES = 500' in source
     assert 'DROID_EVAL_FRACTION = 0.2' in source
     assert 'DROID_FPS = DROID_DEFAULT_FPS' in source
     assert 'ACTION_HORIZON = 1' in source

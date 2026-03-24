@@ -28,7 +28,7 @@ def test_openvla_notebook_loads_real_data_from_droid():
 
     assert 'USE_DROID = True' in source
     assert 'DROID_DATASET_REPO = "cadene/droid_1.0.1_v30"' in source
-    assert "DROID_MAX_SAMPLES = 1000" in source
+    assert "DROID_MAX_SAMPLES = 500" in source
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
     assert "NUM_EPOCHS = 1" in source
     assert "from data.droid_utils import (" in source

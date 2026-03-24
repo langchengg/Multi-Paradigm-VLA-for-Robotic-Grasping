@@ -12,6 +12,7 @@ from /kaggle/working without manually publishing them as Kaggle Datasets.
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -19,7 +20,72 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOK_DIR = PROJECT_ROOT / "notebooks"
+
+
+def _path_size_bytes(path):
+    """Estimate the total on-disk size for a file or directory."""
+    if not path.exists():
+        return 0
+    if path.is_file() or path.is_symlink():
+        return path.stat().st_size
+
+    total = 0
+    for child in path.rglob("*"):
+        if child.is_file():
+            try:
+                total += child.stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _remove_path(path):
+    """Remove a file or directory if it exists."""
+    if not path.exists():
+        return
+    if path.is_file() or path.is_symlink():
+        path.unlink(missing_ok=True)
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def cleanup_after_openvla_step(working_root=Path("/kaggle/working"), home_dir=Path.home()):
+    """
+    Reclaim disk after Notebook 2 while preserving everything Notebook 3 still needs.
+
+    We intentionally keep:
+    - /kaggle/working/openvla-finetuned/final
+    - Hugging Face model/module caches used to reload OpenVLA in Notebook 3
+    """
+    openvla_dir = working_root / "openvla-finetuned"
+    targets = [
+        working_root / "demos",
+        working_root / "expert_demo.gif",
+        home_dir / ".cache" / "pip",
+        home_dir / ".cache" / "huggingface" / "datasets",
+    ]
+    targets.extend(sorted(openvla_dir.glob("checkpoint-*")))
+
+    removed = []
+    reclaimed_bytes = 0
+    for path in targets:
+        if not path.exists():
+            continue
+        size_bytes = _path_size_bytes(path)
+        _remove_path(path)
+        reclaimed_bytes += size_bytes
+        removed.append((path, size_bytes))
+
+    print("\n" + "-" * 78)
+    print("Post-Notebook 2 Cleanup")
+    print("-" * 78)
+    if not removed:
+        print("No disposable caches or intermediates were found.")
+        return
+
+    for path, size_bytes in removed:
+        print(f"Removed: {path} ({size_bytes / 1024 / 1024:.1f} MB)")
+    print(f"Reclaimed approximately {reclaimed_bytes / 1024 / 1024 / 1024:.2f} GB")
 
 
 def build_pipeline_steps(project_root):
@@ -37,6 +103,7 @@ def build_pipeline_steps(project_root):
             "script": project_root / "notebooks" / "02_openvla_qlora_finetune.py",
             "env": {"VLA_DEMO_DIR": str(working_root / "demos")},
             "outputs": [working_root / "openvla-finetuned" / "final"],
+            "post_run": cleanup_after_openvla_step,
         },
         {
             "name": "Notebook 3: Train baselines + offline DROID eval",
@@ -66,7 +133,7 @@ def parse_steps_arg(raw_value, total_steps):
     return indices
 
 
-def run_step(step, python_executable):
+def run_step(step, python_executable, keep_intermediates=False):
     """Execute one notebook script with the requested environment overrides."""
     env = os.environ.copy()
     env.update(step["env"])
@@ -88,6 +155,9 @@ def run_step(step, python_executable):
     for path in step["outputs"]:
         print(f"  Output check: {path} -> {'found' if path.exists() else 'missing'}")
 
+    if not keep_intermediates and step.get("post_run") is not None:
+        step["post_run"]()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run the full Kaggle VLA pipeline in one session.")
@@ -95,6 +165,11 @@ def main():
         "--steps",
         default="all",
         help="Comma-separated subset of steps to run (1,2,3) or 'all'. Default: all.",
+    )
+    parser.add_argument(
+        "--keep-intermediates",
+        action="store_true",
+        help="Disable the low-disk cleanup that normally runs after Notebook 2.",
     )
     args = parser.parse_args()
 
@@ -107,10 +182,11 @@ def main():
     print(f"Project root: {PROJECT_ROOT}")
     print(f"Selected steps: {[index + 1 for index in selected_indices]}")
     print("This mode reuses /kaggle/working outputs and avoids manual Dataset publishing.")
+    print(f"Low-disk cleanup after Notebook 2: {'off' if args.keep_intermediates else 'on'}")
 
     total_start = time.time()
     for index in selected_indices:
-        run_step(steps[index], sys.executable)
+        run_step(steps[index], sys.executable, keep_intermediates=args.keep_intermediates)
 
     total_elapsed = time.time() - total_start
     print("\n" + "=" * 78)
@@ -118,10 +194,11 @@ def main():
     print("=" * 78)
     print(f"Total elapsed: {total_elapsed / 3600:.2f} h")
     print("Expected final artifacts:")
-    print("  /kaggle/working/demos")
     print("  /kaggle/working/openvla-finetuned/final")
     print("  /kaggle/working/results/real_offline_summary.json")
     print("  /kaggle/working/results/technical_report.md")
+    if args.keep_intermediates:
+        print("  /kaggle/working/demos")
 
 
 if __name__ == "__main__":

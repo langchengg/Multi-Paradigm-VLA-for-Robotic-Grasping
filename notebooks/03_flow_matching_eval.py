@@ -131,7 +131,7 @@ DROID_DATASET_REPO_CANDIDATES = [
     if repo
 ]
 DROID_SPLIT = "train"
-DROID_MAX_SAMPLES = 1000
+DROID_MAX_SAMPLES = 500  # keep the real-data subset small enough for low-disk Kaggle runs
 DROID_EVAL_FRACTION = 0.2
 DROID_FPS = DROID_DEFAULT_FPS
 

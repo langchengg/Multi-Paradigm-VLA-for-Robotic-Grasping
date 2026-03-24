@@ -341,7 +341,7 @@ If you prefer separate notebooks, run the 3 notebook scripts in order:
 **Notebook 3** → Trains lightweight FlowMatching/Diffusion VLAs + held-out DROID offline eval
 
 If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The install cells in Notebook 2 and 3 do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.
-Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 1000 real Franka robot samples from [`cadene/droid_1.0.1_v30`](https://huggingface.co/datasets/cadene/droid_1.0.1_v30). Both Notebook 2 and Notebook 3 import the same DROID-to-Franka conversion helpers from `data/droid_utils.py`, so training and offline evaluation use one shared action interface. The default Kaggle-fast preset also runs for 1 epoch. If neither source yields data, it fails immediately instead of pretending external data was loaded.
+Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 500 real Franka robot samples from [`cadene/droid_1.0.1_v30`](https://huggingface.co/datasets/cadene/droid_1.0.1_v30). Both Notebook 2 and Notebook 3 import the same DROID-to-Franka conversion helpers from `data/droid_utils.py`, so training and offline evaluation use one shared action interface. The default Kaggle-fast preset also runs for 1 epoch. The single-entry Kaggle pipeline also deletes demos, adapter checkpoints, pip cache, and Hugging Face datasets cache after Notebook 2 unless you pass `--keep-intermediates`. If neither source yields data, it fails immediately instead of pretending external data was loaded.
 
 ### Step 6: View Results
 
