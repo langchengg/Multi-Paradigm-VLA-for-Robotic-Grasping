@@ -327,11 +327,15 @@ class _OpenCVVideoCache:
     def __init__(self, max_open=4):
         self.max_open = max_open
         self._caps = OrderedDict()
+        self._imageio_readers = OrderedDict()
 
     def close(self):
         for cap in self._caps.values():
             cap.release()
         self._caps.clear()
+        for reader in self._imageio_readers.values():
+            reader.close()
+        self._imageio_readers.clear()
 
     def _get_cap(self, video_path):
         import cv2
@@ -350,13 +354,48 @@ class _OpenCVVideoCache:
     def read_frame(self, video_path, frame_index):
         import cv2
 
+        errors = {}
+
         cap = self._get_cap(video_path)
-        if not cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index)):
-            raise ValueError(f"Failed to seek to frame {frame_index} in {video_path}")
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            raise ValueError(f"Failed to decode frame {frame_index} in {video_path}")
-        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        try:
+            if not cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index)):
+                raise ValueError(f"Failed to seek to frame {frame_index} in {video_path}")
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise ValueError(f"Failed to decode frame {frame_index} in {video_path}")
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        except Exception as exc:
+            errors["cv2"] = f"{type(exc).__name__}: {exc}"
+
+        try:
+            return self._read_frame_imageio(video_path, frame_index)
+        except Exception as exc:
+            errors["imageio"] = f"{type(exc).__name__}: {exc}"
+
+        raise ValueError(
+            f"Failed to decode frame {frame_index} in {video_path} via cv2/imageio. Errors: {errors}"
+        )
+
+    def _get_imageio_reader(self, video_path):
+        import imageio.v2 as imageio
+
+        reader = self._imageio_readers.pop(video_path, None)
+        if reader is None:
+            reader = imageio.get_reader(video_path, format="ffmpeg")
+        self._imageio_readers[video_path] = reader
+        while len(self._imageio_readers) > self.max_open:
+            _, old_reader = self._imageio_readers.popitem(last=False)
+            old_reader.close()
+        return reader
+
+    def _read_frame_imageio(self, video_path, frame_index):
+        reader = self._get_imageio_reader(video_path)
+        frame = np.asarray(reader.get_data(int(frame_index)))
+        if frame.ndim != 3:
+            raise ValueError(
+                f"ImageIO returned frame with shape {frame.shape} for {video_path}:{frame_index}"
+            )
+        return frame
 
 
 def iter_droid_v30_stream(
@@ -454,10 +493,17 @@ def iter_droid_v30_stream(
                         last_error = exc
 
                 if image is None:
-                    raise ValueError(
-                        f"Could not decode any DROID camera frame for {repo_id}:{data_file}:"
-                        f"{local_episode_idx}:{frame_index}"
-                    ) from last_error
+                    out = dict(sample)
+                    out["observation.images.active_camera"] = None
+                    out["episode_instruction"] = episode_instruction
+                    out["decoded_image"] = None
+                    if last_error is not None:
+                        out["decode_error"] = f"{type(last_error).__name__}: {last_error}"
+                    yield out
+                    yielded += 1
+                    if max_samples is not None and yielded >= max_samples:
+                        return
+                    continue
 
                 out = dict(sample)
                 out["observation.images.active_camera"] = used_camera

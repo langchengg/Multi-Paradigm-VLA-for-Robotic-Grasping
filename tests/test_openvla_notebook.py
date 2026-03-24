@@ -33,6 +33,7 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
     assert "NUM_EPOCHS = 1" in source
     assert '"opencv-python-headless>=4.9.0"' in source
+    assert '"imageio-ffmpeg>=0.4.9"' in source
     assert "from data.droid_utils import (" in source
     assert "def resolve_demo_dir(preferred_dir):" in source
     assert "iter_droid_v30_stream," in source
@@ -41,6 +42,8 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert "droid_cartesian_velocity_to_franka_action," in source
     assert "droid_action_to_franka_action," in source
     assert 'image = sample_get(sample, "decoded_image")' in source
+    assert 'sample_get(sample, "decode_error")' in source
+    assert '"episode_instruction",' in source
     assert "max_raw_droid_frames = max(DROID_MAX_SAMPLES * 8, 2000)" in source
     assert 'raw_action = sample_get(sample, "action.original", "action")' in source
     assert 'cartesian_velocity = sample_get(sample, "action.cartesian_velocity")' in source

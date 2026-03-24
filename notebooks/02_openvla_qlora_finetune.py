@@ -56,6 +56,8 @@ def install():
         "torch==2.2.0",
         "torchvision==0.17.0",
         "opencv-python-headless>=4.9.0",
+        "imageio>=2.30.0",
+        "imageio-ffmpeg>=0.4.9",
         "transformers==4.40.1",
         "tokenizers==0.19.1",
         "accelerate==0.30.1",
@@ -403,7 +405,10 @@ class VLADemoDataset(Dataset):
 
                         image = sample_get(sample, "decoded_image")
                         if image is None:
-                            candidate_skip_stats["missing_image"] += 1
+                            if sample_get(sample, "decode_error") is not None:
+                                candidate_skip_stats["bad_image"] += 1
+                            else:
+                                candidate_skip_stats["missing_image"] += 1
                             if idx >= max_raw_droid_frames and droid_count == 0:
                                 break
                             continue

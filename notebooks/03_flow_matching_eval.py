@@ -69,6 +69,7 @@ def install():
         f"numpy=={NUMPY_VERSION}",
         "matplotlib>=3.7.0",
         "imageio>=2.30.0",
+        "imageio-ffmpeg>=0.4.9",
         "datasets",
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
@@ -259,7 +260,10 @@ def load_real_droid_records(max_samples):
 
             image = sample_get(sample, "decoded_image")
             if image is None:
-                candidate_skip_stats["missing_image"] += 1
+                if sample_get(sample, "decode_error") is not None:
+                    candidate_skip_stats["bad_image"] += 1
+                else:
+                    candidate_skip_stats["missing_image"] += 1
                 if idx >= max_raw_droid_frames and not records:
                     break
                 continue

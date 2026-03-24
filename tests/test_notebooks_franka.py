@@ -40,6 +40,7 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert 'DROID_FPS = DROID_DEFAULT_FPS' in source
     assert 'ACTION_HORIZON = 1' in source
     assert '"opencv-python-headless>=4.9.0"' in source
+    assert '"imageio-ffmpeg>=0.4.9"' in source
     assert "from data.droid_utils import (" in source
     assert "iter_droid_v30_stream," in source
     assert "load_droid_info," in source
@@ -50,6 +51,8 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "return self.flow_head.sample(features, num_steps=steps)" in source
     assert "def load_real_droid_records(max_samples):" in source
     assert 'image = sample_get(sample, "decoded_image")' in source
+    assert 'sample_get(sample, "decode_error")' in source
+    assert '"episode_instruction",' in source
     assert "max_raw_droid_frames = max(max_samples * 8, 2000)" in source
     assert "def split_records_by_episode(records, eval_fraction):" in source
     assert "DROID skip stats:" in source
