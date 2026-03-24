@@ -245,11 +245,11 @@ def load_real_droid_records(max_samples):
             "bad_action": 0,
         }
 
+        max_raw_droid_frames = max(max_samples * 8, 2000)
         for idx, sample in enumerate(
             iter_droid_v30_stream(
                 candidate,
                 split=DROID_SPLIT,
-                max_samples=max_samples,
             )
         ):
             success = sample_get(sample, "is_episode_successful")
@@ -260,6 +260,8 @@ def load_real_droid_records(max_samples):
             image = sample_get(sample, "decoded_image")
             if image is None:
                 candidate_skip_stats["missing_image"] += 1
+                if idx >= max_raw_droid_frames and not records:
+                    break
                 continue
 
             instruction = sample_get(
@@ -276,6 +278,8 @@ def load_real_droid_records(max_samples):
                 instruction = None
             if instruction is None:
                 candidate_skip_stats["missing_instruction"] += 1
+                if idx >= max_raw_droid_frames and not records:
+                    break
                 continue
 
             raw_action = sample_get(sample, "action.original", "action")

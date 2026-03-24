@@ -389,11 +389,11 @@ class VLADemoDataset(Dataset):
                         "bad_action": 0,
                     }
 
+                    max_raw_droid_frames = max(DROID_MAX_SAMPLES * 8, 2000)
                     for idx, sample in enumerate(
                         iter_droid_v30_stream(
                             candidate,
                             split=DROID_SPLIT,
-                            max_samples=DROID_MAX_SAMPLES,
                         )
                     ):
                         success = sample_get(sample, "is_episode_successful")
@@ -404,6 +404,8 @@ class VLADemoDataset(Dataset):
                         image = sample_get(sample, "decoded_image")
                         if image is None:
                             candidate_skip_stats["missing_image"] += 1
+                            if idx >= max_raw_droid_frames and droid_count == 0:
+                                break
                             continue
 
                         instruction = sample_get(
@@ -420,6 +422,8 @@ class VLADemoDataset(Dataset):
                             instruction = None
                         if instruction is None:
                             candidate_skip_stats["missing_instruction"] += 1
+                            if idx >= max_raw_droid_frames and droid_count == 0:
+                                break
                             continue
 
                         raw_action = sample_get(sample, "action.original", "action")

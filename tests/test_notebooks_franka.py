@@ -34,18 +34,23 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "def verify_torch_numpy_bridge():" in source
     assert "torch.tensor([1.0]).numpy()" in source
     assert 'DROID_DATASET_REPO_CANDIDATES = [' in source
-    assert '"cadene/droid"' in source
+    assert '"cadene/droid_1.0.1_v30"' in source
     assert 'DROID_MAX_SAMPLES = 500' in source
     assert 'DROID_EVAL_FRACTION = 0.2' in source
     assert 'DROID_FPS = DROID_DEFAULT_FPS' in source
     assert 'ACTION_HORIZON = 1' in source
+    assert '"opencv-python-headless>=4.9.0"' in source
     assert "from data.droid_utils import (" in source
+    assert "iter_droid_v30_stream," in source
+    assert "load_droid_info," in source
     assert "from models.flow_matching_head import FlowMatchingHead" in source
     assert "self.action_dim = action_dim" in source
     assert "self.horizon = horizon" in source
     assert "action_horizon=horizon" in source
     assert "return self.flow_head.sample(features, num_steps=steps)" in source
     assert "def load_real_droid_records(max_samples):" in source
+    assert 'image = sample_get(sample, "decoded_image")' in source
+    assert "max_raw_droid_frames = max(max_samples * 8, 2000)" in source
     assert "def split_records_by_episode(records, eval_fraction):" in source
     assert "DROID skip stats:" in source
     assert "class OfflineRealDataEvaluator:" in source

@@ -28,18 +28,20 @@ def test_openvla_notebook_loads_real_data_from_droid():
 
     assert 'USE_DROID = True' in source
     assert 'DROID_DATASET_REPO_CANDIDATES = [' in source
-    assert '"cadene/droid"' in source
     assert '"cadene/droid_1.0.1_v30"' in source
     assert "DROID_MAX_SAMPLES = 500" in source
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
     assert "NUM_EPOCHS = 1" in source
+    assert '"opencv-python-headless>=4.9.0"' in source
     assert "from data.droid_utils import (" in source
     assert "def resolve_demo_dir(preferred_dir):" in source
-    assert 'load_dataset(' in source
-    assert 'streaming=True' in source
+    assert "iter_droid_v30_stream," in source
+    assert "load_droid_info," in source
     assert "load_droid_task_lookup," in source
     assert "droid_cartesian_velocity_to_franka_action," in source
     assert "droid_action_to_franka_action," in source
+    assert 'image = sample_get(sample, "decoded_image")' in source
+    assert "max_raw_droid_frames = max(DROID_MAX_SAMPLES * 8, 2000)" in source
     assert 'raw_action = sample_get(sample, "action.original", "action")' in source
     assert 'cartesian_velocity = sample_get(sample, "action.cartesian_velocity")' in source
     assert 'gripper_position = sample_get(sample, "action.gripper_position")' in source
