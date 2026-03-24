@@ -91,6 +91,8 @@ from data.droid_utils import (
     ACTION_MAX,
     ACTION_MIN,
     DROID_DEFAULT_FPS,
+    DROID_FRAME_STRIDE_DEFAULT,
+    DROID_MAX_FRAMES_PER_EPISODE_DEFAULT,
     FRANKA_ACTION_KEYS,
     GRIPPER_CLOSE_VALUE,
     GRIPPER_OPEN_VALUE,
@@ -104,6 +106,7 @@ from data.droid_utils import (
     load_droid_task_lookup,
     load_droid_info,
     sample_get,
+    select_droid_frame,
 )
 
 USE_DROID = True                                # Mix in real DROID robot data from HF
@@ -121,6 +124,8 @@ DROID_DATASET_REPO_CANDIDATES = [
 DROID_SPLIT = "train"
 DROID_MAX_SAMPLES = 500                         # lower the real-data mix for low-disk Kaggle runs
 DROID_FPS = DROID_DEFAULT_FPS                   # keep one shared control-rate assumption
+DROID_FRAME_STRIDE = DROID_FRAME_STRIDE_DEFAULT
+DROID_MAX_FRAMES_PER_EPISODE = DROID_MAX_FRAMES_PER_EPISODE_DEFAULT
 OUTPUT_DIR = "/kaggle/working/openvla-finetuned"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -136,6 +141,7 @@ IMAGE_SIZE = 224                  # OpenVLA input resolution
 MAX_SEQ_LEN = 256
 SAVE_STEPS = 200
 LOG_STEPS = 10
+OPENVLA_MAX_NEW_TOKENS = 96
 
 print(f"✅ Config ready")
 print(f"   Model: {MODEL_NAME}")
@@ -151,6 +157,10 @@ print(
 )
 if USE_DROID:
     print(f"   DROID control rate assumption: {DROID_FPS:g} Hz")
+    print(
+        f"   DROID frame sampling: stride={DROID_FRAME_STRIDE}, "
+        f"max {DROID_MAX_FRAMES_PER_EPISODE} frames/episode"
+    )
 
 # ──── Shared Franka Delta-Pose Action Semantics ────
 
@@ -192,16 +202,41 @@ FRANKA_ACTION_PATTERN = re.compile(
     r"daz=(?P<daz>[+-]?\d+(?:\.\d+)?)\s+"
     r"gripper=(?P<gripper>open|close)"
 )
+FRANKA_KEY_VALUE_PATTERN = re.compile(
+    r"\b(?P<key>dx|dy|dz|dax|day|daz)\s*=\s*(?P<value>[+-]?\d+(?:\.\d+)?)"
+)
+FRANKA_GRIPPER_PATTERN = re.compile(r"\bgripper\s*=\s*(open|close)\b", re.IGNORECASE)
+FRANKA_VECTOR_PATTERN = re.compile(
+    r"\[\s*([+-]?\d+(?:\.\d+)?)"
+    r"(?:\s*,\s*([+-]?\d+(?:\.\d+)?)){6,}\s*\]"
+)
 
 
 def parse_franka_action(text):
     """Parse the generated textual action back into the env's normalized 7-DOF control."""
     match = FRANKA_ACTION_PATTERN.search(text)
-    if match is None:
-        return None
-    values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
-    values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
-    return ensure_franka_action_7d(values)
+    if match is not None:
+        values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
+        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
+        return ensure_franka_action_7d(values)
+
+    keyed_values = {}
+    for keyed_match in FRANKA_KEY_VALUE_PATTERN.finditer(text):
+        keyed_values[keyed_match.group("key")] = float(keyed_match.group("value"))
+    if all(key in keyed_values for key in FRANKA_ACTION_KEYS[:-1]):
+        gripper_match = FRANKA_GRIPPER_PATTERN.search(text)
+        if gripper_match is not None:
+            values = [keyed_values[key] for key in FRANKA_ACTION_KEYS[:-1]]
+            values.append(
+                GRIPPER_CLOSE_VALUE if gripper_match.group(1).lower() == "close" else GRIPPER_OPEN_VALUE
+            )
+            return ensure_franka_action_7d(values)
+
+    numeric_values = [float(value) for value in re.findall(r"[+-]?\d+(?:\.\d+)?", text)]
+    if len(numeric_values) >= 7:
+        numeric_values[6] = GRIPPER_CLOSE_VALUE if numeric_values[6] > 0 else GRIPPER_OPEN_VALUE
+        return ensure_franka_action_7d(numeric_values[:7])
+    return None
 
 
 def format_physical_delta(action):
@@ -395,12 +430,15 @@ class VLADemoDataset(Dataset):
                     droid_info = load_droid_info(candidate)
                     candidate_skip_stats = {
                         "unsuccessful": 0,
+                        "frame_stride": 0,
+                        "episode_cap": 0,
                         "missing_image": 0,
                         "missing_instruction": 0,
                         "missing_action": 0,
                         "bad_image": 0,
                         "bad_action": 0,
                     }
+                    episode_counts = {}
 
                     max_raw_droid_frames = max(DROID_MAX_SAMPLES * 8, 2000)
                     for idx, sample in enumerate(
@@ -412,6 +450,16 @@ class VLADemoDataset(Dataset):
                         success = sample_get(sample, "is_episode_successful")
                         if success is False:
                             candidate_skip_stats["unsuccessful"] += 1
+                            continue
+
+                        keep_sample, episode_index, frame_index, skip_reason = select_droid_frame(
+                            sample,
+                            episode_counts,
+                            frame_stride=DROID_FRAME_STRIDE,
+                            max_frames_per_episode=DROID_MAX_FRAMES_PER_EPISODE,
+                        )
+                        if not keep_sample:
+                            candidate_skip_stats[skip_reason] += 1
                             continue
 
                         image = sample_get(sample, "decoded_image")
@@ -481,6 +529,8 @@ class VLADemoDataset(Dataset):
                             "action_7d": action_7d,
                             "source": "droid",
                         })
+                        if episode_index is not None:
+                            episode_counts[episode_index] = episode_counts.get(episode_index, 0) + 1
                         droid_count += 1
                         droid_repo = candidate
                         if droid_count >= DROID_MAX_SAMPLES:
@@ -768,21 +818,31 @@ print(f"{'='*60}")
 # ═══════════════════════════════════════════════════════════════
 
 model.eval()
+if hasattr(model, "config"):
+    model.config.use_cache = True
 
 test_image = dataset[0]["image"]
 test_instruction = dataset[0]["instruction"]
 
 prompt = format_vla_prompt(test_instruction)
-inputs = processor(
+raw_inputs = processor(
     images=[test_image],
     text=[prompt],
     return_tensors="pt",
-).to(model.device)
+)
+input_device = next(model.parameters()).device
+input_dtype = next(model.parameters()).dtype
+inputs = {}
+for key, value in raw_inputs.items():
+    if torch.is_floating_point(value):
+        inputs[key] = value.to(device=input_device, dtype=input_dtype)
+    else:
+        inputs[key] = value.to(input_device)
 
 with torch.no_grad():
     generated = model.generate(
         **inputs,
-        max_new_tokens=48,
+        max_new_tokens=OPENVLA_MAX_NEW_TOKENS,
         do_sample=False,
     )
     generated_text = processor.batch_decode(

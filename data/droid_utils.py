@@ -25,6 +25,9 @@ GRIPPER_CLOSE_VALUE = 1.0
 ACTION_MIN = -1.0
 ACTION_MAX = 1.0
 DROID_DEFAULT_FPS = 15.0
+DROID_FRAME_STRIDE_DEFAULT = 8
+DROID_MAX_FRAMES_PER_EPISODE_DEFAULT = 64
+DROID_GRIPPER_VELOCITY_EPS = 1e-3
 DROID_CAMERA_KEYS = (
     "observation.images.exterior_1_left",
     "observation.images.exterior_2_left",
@@ -36,6 +39,9 @@ __all__ = [
     "ACTION_MIN",
     "DROID_CAMERA_KEYS",
     "DROID_DEFAULT_FPS",
+    "DROID_FRAME_STRIDE_DEFAULT",
+    "DROID_GRIPPER_VELOCITY_EPS",
+    "DROID_MAX_FRAMES_PER_EPISODE_DEFAULT",
     "FRANKA_ACTION_KEYS",
     "GRIPPER_CLOSE_VALUE",
     "GRIPPER_OPEN_VALUE",
@@ -50,6 +56,8 @@ __all__ = [
     "load_droid_info",
     "load_droid_task_lookup",
     "sample_get",
+    "select_droid_frame",
+    "select_droid_gripper_command",
 ]
 
 
@@ -86,6 +94,75 @@ def gripper_value_to_binary_command(
     return gripper_close_value if scalar > 0.0 else gripper_open_value
 
 
+def select_droid_gripper_command(
+    *,
+    gripper_position=None,
+    gripper_velocity=None,
+    velocity_epsilon=DROID_GRIPPER_VELOCITY_EPS,
+    gripper_open_value=GRIPPER_OPEN_VALUE,
+    gripper_close_value=GRIPPER_CLOSE_VALUE,
+):
+    """
+    Map DROID gripper annotations to this repo's binary open/close action.
+
+    For Cartesian-velocity control, `gripper_velocity` is the closest signal to the
+    instantaneous command, so we prefer it whenever it is meaningfully non-zero.
+    When the command is stationary, we fall back to `gripper_position` to preserve
+    the intended open/close state.
+    """
+    if gripper_velocity is not None:
+        velocity_scalar = float(np.asarray(gripper_velocity, dtype=np.float32).reshape(-1)[0])
+        if abs(velocity_scalar) > velocity_epsilon:
+            return gripper_close_value if velocity_scalar > 0.0 else gripper_open_value
+    if gripper_position is not None:
+        return gripper_value_to_binary_command(
+            gripper_position,
+            gripper_open_value=gripper_open_value,
+            gripper_close_value=gripper_close_value,
+        )
+    if gripper_velocity is not None:
+        return gripper_value_to_binary_command(
+            gripper_velocity,
+            gripper_open_value=gripper_open_value,
+            gripper_close_value=gripper_close_value,
+        )
+    return gripper_open_value
+
+
+def select_droid_frame(
+    sample,
+    episode_counts,
+    *,
+    frame_stride=DROID_FRAME_STRIDE_DEFAULT,
+    max_frames_per_episode=DROID_MAX_FRAMES_PER_EPISODE_DEFAULT,
+):
+    """
+    Decide whether to keep a DROID frame for training/evaluation.
+
+    The public DROID shards contain long runs of adjacent frames from one episode.
+    Without subsampling, small Kaggle-safe subsets collapse to only one or two tasks,
+    which hurts action diversity and gripper supervision.
+    """
+    episode_index = sample_get(sample, "episode_index")
+    frame_index = sample_get(sample, "frame_index")
+
+    if episode_index is not None:
+        episode_index = int(np.asarray(episode_index).reshape(-1)[0])
+    if frame_index is None:
+        frame_index = 0
+    frame_index = int(np.asarray(frame_index).reshape(-1)[0])
+
+    if frame_stride > 1 and frame_index % frame_stride != 0:
+        return False, episode_index, frame_index, "frame_stride"
+    if (
+        episode_index is not None
+        and max_frames_per_episode is not None
+        and episode_counts.get(episode_index, 0) >= max_frames_per_episode
+    ):
+        return False, episode_index, frame_index, "episode_cap"
+    return True, episode_index, frame_index, None
+
+
 def droid_cartesian_velocity_to_franka_action(
     cartesian_velocity,
     *,
@@ -116,20 +193,12 @@ def droid_cartesian_velocity_to_franka_action(
 
     delta_xyz = velocity[:3] / droid_fps
     delta_rpy = velocity[3:6] / droid_fps
-    if gripper_position is not None:
-        gripper = gripper_value_to_binary_command(
-            gripper_position,
-            gripper_open_value=gripper_open_value,
-            gripper_close_value=gripper_close_value,
-        )
-    elif gripper_velocity is not None:
-        gripper = gripper_value_to_binary_command(
-            gripper_velocity,
-            gripper_open_value=gripper_open_value,
-            gripper_close_value=gripper_close_value,
-        )
-    else:
-        gripper = gripper_open_value
+    gripper = select_droid_gripper_command(
+        gripper_position=gripper_position,
+        gripper_velocity=gripper_velocity,
+        gripper_open_value=gripper_open_value,
+        gripper_close_value=gripper_close_value,
+    )
 
     normalized = np.array(
         [

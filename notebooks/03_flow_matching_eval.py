@@ -92,6 +92,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torch.utils.data import DataLoader, Dataset
 import matplotlib.pyplot as plt
@@ -104,6 +105,8 @@ from data.droid_utils import (
     ACTION_MAX,
     ACTION_MIN,
     DROID_DEFAULT_FPS,
+    DROID_FRAME_STRIDE_DEFAULT,
+    DROID_MAX_FRAMES_PER_EPISODE_DEFAULT,
     FRANKA_ACTION_KEYS,
     GRIPPER_CLOSE_VALUE,
     GRIPPER_OPEN_VALUE,
@@ -117,6 +120,7 @@ from data.droid_utils import (
     load_droid_info,
     load_droid_task_lookup,
     sample_get,
+    select_droid_frame,
 )
 
 print(f"✅ Loaded: PyTorch {torch.__version__}")
@@ -143,6 +147,8 @@ DROID_SPLIT = "train"
 DROID_MAX_SAMPLES = 500  # keep the real-data subset small enough for low-disk Kaggle runs
 DROID_EVAL_FRACTION = 0.2
 DROID_FPS = DROID_DEFAULT_FPS
+DROID_FRAME_STRIDE = DROID_FRAME_STRIDE_DEFAULT
+DROID_MAX_FRAMES_PER_EPISODE = DROID_MAX_FRAMES_PER_EPISODE_DEFAULT
 
 # Training config
 FLOW_TRAIN_EPOCHS = 10
@@ -155,6 +161,8 @@ ACTION_HORIZON = 1
 MAX_SEQ_LEN = 256
 MAX_EVAL_SAMPLES = 200
 QUALITATIVE_EXAMPLES = 6
+GRIPPER_LOSS_WEIGHT = 3.0
+OPENVLA_MAX_NEW_TOKENS = 96
 
 OPENVLA_BASE_MODEL = "openvla/openvla-7b"
 OPENVLA_CANDIDATE_DIRS = [
@@ -178,6 +186,10 @@ print(f"   DROID repos: {DROID_DATASET_REPO_CANDIDATES}")
 print(f"   DROID max streamed samples: {DROID_MAX_SAMPLES}")
 print(f"   Held-out eval fraction: {DROID_EVAL_FRACTION:.0%}")
 print(f"   DROID control rate assumption: {DROID_FPS:g} Hz")
+print(
+    f"   DROID frame sampling: stride={DROID_FRAME_STRIDE}, "
+    f"max {DROID_MAX_FRAMES_PER_EPISODE} frames/episode"
+)
 print(f"   Action horizon: {ACTION_HORIZON}")
 print(f"   OpenVLA adapter dir: {OPENVLA_MODEL_DIR or 'not found yet'}")
 
@@ -202,15 +214,36 @@ FRANKA_ACTION_PATTERN = re.compile(
     r"daz=(?P<daz>[+-]?\d+(?:\.\d+)?)\s+"
     r"gripper=(?P<gripper>open|close)"
 )
+FRANKA_KEY_VALUE_PATTERN = re.compile(
+    r"\b(?P<key>dx|dy|dz|dax|day|daz)\s*=\s*(?P<value>[+-]?\d+(?:\.\d+)?)"
+)
+FRANKA_GRIPPER_PATTERN = re.compile(r"\bgripper\s*=\s*(open|close)\b", re.IGNORECASE)
 
 
 def parse_franka_action(text):
     match = FRANKA_ACTION_PATTERN.search(text)
-    if match is None:
-        return None
-    values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
-    values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
-    return ensure_franka_action_7d(values)
+    if match is not None:
+        values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
+        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
+        return ensure_franka_action_7d(values)
+
+    keyed_values = {}
+    for keyed_match in FRANKA_KEY_VALUE_PATTERN.finditer(text):
+        keyed_values[keyed_match.group("key")] = float(keyed_match.group("value"))
+    if all(key in keyed_values for key in FRANKA_ACTION_KEYS[:-1]):
+        gripper_match = FRANKA_GRIPPER_PATTERN.search(text)
+        if gripper_match is not None:
+            values = [keyed_values[key] for key in FRANKA_ACTION_KEYS[:-1]]
+            values.append(
+                GRIPPER_CLOSE_VALUE if gripper_match.group(1).lower() == "close" else GRIPPER_OPEN_VALUE
+            )
+            return ensure_franka_action_7d(values)
+
+    numeric_values = [float(value) for value in re.findall(r"[+-]?\d+(?:\.\d+)?", text)]
+    if len(numeric_values) >= 7:
+        numeric_values[6] = GRIPPER_CLOSE_VALUE if numeric_values[6] > 0 else GRIPPER_OPEN_VALUE
+        return ensure_franka_action_7d(numeric_values[:7])
+    return None
 
 
 def sync_cuda():
@@ -245,12 +278,15 @@ def load_real_droid_records(max_samples):
 
         candidate_skip_stats = {
             "unsuccessful": 0,
+            "frame_stride": 0,
+            "episode_cap": 0,
             "missing_image": 0,
             "missing_instruction": 0,
             "missing_action": 0,
             "bad_image": 0,
             "bad_action": 0,
         }
+        episode_counts = {}
 
         max_raw_droid_frames = max(max_samples * 8, 2000)
         for idx, sample in enumerate(
@@ -262,6 +298,16 @@ def load_real_droid_records(max_samples):
             success = sample_get(sample, "is_episode_successful")
             if success is False:
                 candidate_skip_stats["unsuccessful"] += 1
+                continue
+
+            keep_sample, episode_index, frame_index, skip_reason = select_droid_frame(
+                sample,
+                episode_counts,
+                frame_stride=DROID_FRAME_STRIDE,
+                max_frames_per_episode=DROID_MAX_FRAMES_PER_EPISODE,
+            )
+            if not keep_sample:
+                candidate_skip_stats[skip_reason] += 1
                 continue
 
             image = sample_get(sample, "decoded_image")
@@ -322,10 +368,8 @@ def load_real_droid_records(max_samples):
                 candidate_skip_stats["bad_image"] += 1
                 continue
 
-            episode_index = sample_get(sample, "episode_index")
             if episode_index is None:
                 episode_index = int(idx)
-            frame_index = sample_get(sample, "frame_index")
             if frame_index is None:
                 frame_index = 0
 
@@ -338,6 +382,7 @@ def load_real_droid_records(max_samples):
                 "source": "droid",
                 "sample_index": idx,
             })
+            episode_counts[episode_index] = episode_counts.get(episode_index, 0) + 1
             repo_id = candidate
             if len(records) >= max_samples:
                 break
@@ -401,6 +446,14 @@ def compute_action_stats(records):
     return actions.mean(axis=0), actions.std(axis=0).clip(min=1e-6)
 
 
+def compute_gripper_pos_weight(records):
+    gripper_closed = np.array([record["action_7d"][6] > 0 for record in records], dtype=np.float32)
+    pos_count = float(gripper_closed.sum())
+    neg_count = float(len(gripper_closed) - pos_count)
+    pos_weight = neg_count / max(pos_count, 1.0)
+    return pos_weight, float(gripper_closed.mean())
+
+
 class RealRobotActionDataset(Dataset):
     """Frame-level DROID dataset for offline one-step action prediction."""
 
@@ -433,6 +486,7 @@ def collate_fn(batch):
 ACTIVE_DROID_REPO, all_droid_records = load_real_droid_records(DROID_MAX_SAMPLES)
 train_records, eval_records = split_records_by_episode(all_droid_records, DROID_EVAL_FRACTION)
 train_action_mean, train_action_std = compute_action_stats(train_records)
+train_gripper_pos_weight, train_gripper_close_rate = compute_gripper_pos_weight(train_records)
 
 train_dataset = RealRobotActionDataset(train_records, img_size=IMAGE_SIZE)
 eval_dataset = RealRobotActionDataset(eval_records, img_size=IMAGE_SIZE)
@@ -447,6 +501,10 @@ train_loader = DataLoader(
 
 print(f"✅ Offline datasets ready: {len(train_dataset)} train samples, {len(eval_dataset)} eval samples")
 print(f"   Using DROID repo: {ACTIVE_DROID_REPO}")
+print(
+    f"   Train gripper close rate: {train_gripper_close_rate:.1%} "
+    f"(BCE pos_weight={train_gripper_pos_weight:.2f})"
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -482,6 +540,7 @@ class FlowMatchingVLA(nn.Module):
 
         self.vis_proj = nn.Linear(vis_dim, fuse_dim)
         self.txt_proj = nn.Linear(txt_dim, fuse_dim)
+        self.gripper_head = nn.Linear(fuse_dim, 1)
         self.fusion = nn.TransformerEncoderLayer(
             d_model=fuse_dim, nhead=8, dim_feedforward=1024, dropout=0.1, batch_first=True)
         self.flow_head = FlowMatchingHead(
@@ -497,6 +556,7 @@ class FlowMatchingVLA(nn.Module):
             transforms.ToTensor(),
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
+        self.register_buffer("gripper_pos_weight", torch.tensor(1.0))
 
     def encode(self, images, instructions):
         vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
@@ -518,15 +578,43 @@ class FlowMatchingVLA(nn.Module):
 
     def forward(self, images, instructions, actions_gt):
         features = self.encode(images, instructions)
-        return self.flow_head(features, actions_gt)
+        action_loss, info = self.flow_head(features, actions_gt)
+        gripper_logits = self.gripper_head(features).squeeze(-1)
+        gripper_targets = (actions_gt[:, 0, 6] > 0).float()
+        gripper_loss = F.binary_cross_entropy_with_logits(
+            gripper_logits,
+            gripper_targets,
+            pos_weight=self.gripper_pos_weight,
+        )
+        total_loss = action_loss + GRIPPER_LOSS_WEIGHT * gripper_loss
+        info["gripper_loss"] = float(gripper_loss.item())
+        info["gripper_close_rate"] = float(gripper_targets.mean().item())
+        return total_loss, info
 
     def set_action_stats(self, mean, std):
         self.flow_head.set_action_stats(mean, std)
 
+    def set_gripper_pos_weight(self, pos_weight):
+        self.gripper_pos_weight.copy_(
+            torch.tensor(
+                float(pos_weight),
+                dtype=torch.float32,
+                device=self.gripper_pos_weight.device,
+            )
+        )
+
     @torch.no_grad()
     def predict(self, images, instructions, steps=10):
         features = self.encode(images, instructions)
-        return self.flow_head.sample(features, num_steps=steps)
+        actions = self.flow_head.sample(features, num_steps=steps)
+        gripper_logits = self.gripper_head(features).squeeze(-1)
+        gripper_values = torch.where(
+            gripper_logits >= 0,
+            torch.full_like(gripper_logits, GRIPPER_CLOSE_VALUE),
+            torch.full_like(gripper_logits, GRIPPER_OPEN_VALUE),
+        )
+        actions[:, :, 6] = gripper_values.unsqueeze(-1)
+        return actions
 
 
 class DiffusionVLA(nn.Module):
@@ -555,6 +643,7 @@ class DiffusionVLA(nn.Module):
 
         self.vis_proj = nn.Linear(vis_dim, fuse_dim)
         self.txt_proj = nn.Linear(txt_dim, fuse_dim)
+        self.gripper_head = nn.Linear(fuse_dim, 1)
         self.fusion = nn.TransformerEncoderLayer(
             d_model=fuse_dim, nhead=8, dim_feedforward=1024, dropout=0.1, batch_first=True)
         self.diffusion_head = DiffusionHead(
@@ -571,6 +660,7 @@ class DiffusionVLA(nn.Module):
             transforms.ToTensor(),
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
+        self.register_buffer("gripper_pos_weight", torch.tensor(1.0))
 
     def encode(self, images, instructions):
         vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
@@ -593,14 +683,42 @@ class DiffusionVLA(nn.Module):
     def set_action_stats(self, mean, std):
         self.diffusion_head.set_action_stats(mean, std)
 
+    def set_gripper_pos_weight(self, pos_weight):
+        self.gripper_pos_weight.copy_(
+            torch.tensor(
+                float(pos_weight),
+                dtype=torch.float32,
+                device=self.gripper_pos_weight.device,
+            )
+        )
+
     def forward(self, images, instructions, actions_gt):
         features = self.encode(images, instructions)
-        return self.diffusion_head(features, actions_gt)
+        action_loss, info = self.diffusion_head(features, actions_gt)
+        gripper_logits = self.gripper_head(features).squeeze(-1)
+        gripper_targets = (actions_gt[:, 0, 6] > 0).float()
+        gripper_loss = F.binary_cross_entropy_with_logits(
+            gripper_logits,
+            gripper_targets,
+            pos_weight=self.gripper_pos_weight,
+        )
+        total_loss = action_loss + GRIPPER_LOSS_WEIGHT * gripper_loss
+        info["gripper_loss"] = float(gripper_loss.item())
+        info["gripper_close_rate"] = float(gripper_targets.mean().item())
+        return total_loss, info
 
     @torch.no_grad()
     def predict(self, images, instructions, steps=10):
         features = self.encode(images, instructions)
-        return self.diffusion_head.sample(features, num_steps=steps)
+        actions = self.diffusion_head.sample(features, num_steps=steps)
+        gripper_logits = self.gripper_head(features).squeeze(-1)
+        gripper_values = torch.where(
+            gripper_logits >= 0,
+            torch.full_like(gripper_logits, GRIPPER_CLOSE_VALUE),
+            torch.full_like(gripper_logits, GRIPPER_OPEN_VALUE),
+        )
+        actions[:, :, 6] = gripper_values.unsqueeze(-1)
+        return actions
 
 
 print("✅ FlowMatchingVLA and DiffusionVLA defined")
@@ -613,14 +731,30 @@ def set_model_action_stats(model, mean, std):
         raise AttributeError("Model does not expose a supported action head.")
 
 
+def set_model_gripper_stats(model, pos_weight):
+    if hasattr(model, "set_gripper_pos_weight"):
+        model.set_gripper_pos_weight(pos_weight)
+
+
 def count_parameters(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return total, trainable
 
 
-def train_vla_model(model, loader, num_epochs, run_name, checkpoint_name, curve_name, action_mean, action_std):
+def train_vla_model(
+    model,
+    loader,
+    num_epochs,
+    run_name,
+    checkpoint_name,
+    curve_name,
+    action_mean,
+    action_std,
+    gripper_pos_weight,
+):
     set_model_action_stats(model, action_mean, action_std)
+    set_model_gripper_stats(model, gripper_pos_weight)
     total, trainable = count_parameters(model)
     print(f"✅ {run_name}: {total/1e6:.1f}M params, {trainable/1e6:.1f}M trainable")
 
@@ -707,6 +841,7 @@ flow_model, flow_train_losses = train_vla_model(
     curve_name="flow_matching_training_curve.png",
     action_mean=train_action_mean,
     action_std=train_action_std,
+    gripper_pos_weight=train_gripper_pos_weight,
 )
 
 diffusion_model = DiffusionVLA(action_dim=ACTION_DIM, horizon=ACTION_HORIZON).to(DEVICE)
@@ -719,6 +854,7 @@ diffusion_model, diffusion_train_losses = train_vla_model(
     curve_name="diffusion_training_curve.png",
     action_mean=train_action_mean,
     action_std=train_action_std,
+    gripper_pos_weight=train_gripper_pos_weight,
 )
 
 
@@ -810,6 +946,8 @@ class OpenVLAPolicyWrapper:
         self.model = PeftModel.from_pretrained(base_model, self.adapter_dir)
         self.processor = AutoProcessor.from_pretrained(self.adapter_dir, trust_remote_code=True)
         self.model.eval()
+        if hasattr(self.model, "config"):
+            self.model.config.use_cache = True
         self.input_device = next(self.model.parameters()).device
         self.input_dtype = next(self.model.parameters()).dtype
 
@@ -833,7 +971,7 @@ class OpenVLAPolicyWrapper:
         start = time.time()
         generated = self.model.generate(
             **inputs,
-            max_new_tokens=48,
+            max_new_tokens=OPENVLA_MAX_NEW_TOKENS,
             do_sample=False,
         )
         sync_cuda()

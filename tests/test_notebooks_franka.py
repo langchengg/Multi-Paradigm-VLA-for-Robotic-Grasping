@@ -51,12 +51,17 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "self.action_dim = action_dim" in source
     assert "self.horizon = horizon" in source
     assert "action_horizon=horizon" in source
-    assert "return self.flow_head.sample(features, num_steps=steps)" in source
+    assert "self.gripper_head = nn.Linear(fuse_dim, 1)" in source
+    assert "GRIPPER_LOSS_WEIGHT = 3.0" in source
+    assert "set_gripper_pos_weight" in source
+    assert "gripper_loss = F.binary_cross_entropy_with_logits(" in source
+    assert "actions = self.flow_head.sample(features, num_steps=steps)" in source
     assert "def load_real_droid_records(max_samples):" in source
     assert 'image = sample_get(sample, "decoded_image")' in source
     assert 'sample_get(sample, "decode_error")' in source
     assert '"episode_instruction",' in source
     assert "max_raw_droid_frames = max(max_samples * 8, 2000)" in source
+    assert "select_droid_frame(" in source
     assert "def split_records_by_episode(records, eval_fraction):" in source
     assert "DROID skip stats:" in source
     assert "class OfflineRealDataEvaluator:" in source
