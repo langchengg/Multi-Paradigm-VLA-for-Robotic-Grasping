@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 NUMPY_VERSION = "1.26.4"
@@ -153,6 +154,14 @@ DROID_MAX_FRAMES_PER_EPISODE = DROID_MAX_FRAMES_PER_EPISODE_DEFAULT
 DROID_KEEP_IDLE_OPEN_PROB = 0.35
 OUTPUT_DIR = "/kaggle/working/openvla-finetuned"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+)
+OPENVLA_LOCAL_DIR = os.environ.get("OPENVLA_LOCAL_DIR", "/kaggle/working/openvla-base")
+HF_DOWNLOAD_RETRIES = 6
+HF_DOWNLOAD_BACKOFF_S = 2.0
 
 # ──── Training Config ────
 MODEL_NAME = "openvla/openvla-7b"
@@ -381,6 +390,41 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from PIL import Image
 import glob
+
+
+def snapshot_download_with_retry(repo_id, local_dir):
+    from huggingface_hub import snapshot_download
+
+    last_exc = None
+    for attempt in range(1, HF_DOWNLOAD_RETRIES + 1):
+        try:
+            return snapshot_download(
+                repo_id=repo_id,
+                local_dir=local_dir,
+                local_dir_use_symlinks=False,
+                token=HF_TOKEN,
+                resume_download=True,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= HF_DOWNLOAD_RETRIES:
+                break
+            wait_s = HF_DOWNLOAD_BACKOFF_S * (2 ** (attempt - 1))
+            print(
+                f"  ⚠️ snapshot_download failed ({type(exc).__name__}: {exc}). "
+                f"Retrying in {wait_s:.1f}s [{attempt}/{HF_DOWNLOAD_RETRIES}]..."
+            )
+            time.sleep(wait_s)
+    token_hint = (
+        "Set Kaggle secret HF_TOKEN to an authenticated Hugging Face token to reduce 429 rate limits."
+        if not HF_TOKEN
+        else "HF_TOKEN was provided, but the Hub still refused the request."
+    )
+    raise RuntimeError(
+        f"Failed to cache {repo_id} after {HF_DOWNLOAD_RETRIES} attempts. {token_hint}"
+    ) from last_exc
 
 
 def resolve_demo_dir(preferred_dir):
@@ -764,6 +808,11 @@ except ImportError:
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 print("Loading OpenVLA-7B with 4-bit quantization...")
+if not HF_TOKEN:
+    print("  ⚠️ HF_TOKEN not set; Hugging Face rate limits may interrupt first-time model downloads.")
+print(f"  Caching base model under: {OPENVLA_LOCAL_DIR}")
+MODEL_SOURCE = snapshot_download_with_retry(MODEL_NAME, OPENVLA_LOCAL_DIR)
+print(f"  ✅ Cached OpenVLA snapshot: {MODEL_SOURCE}")
 
 # 4-bit quantization config
 bnb_config = BitsAndBytesConfig(
@@ -786,12 +835,17 @@ if torch.cuda.is_available():
 else:
     model_kwargs["device_map"] = "cpu"
 
-model = OpenVLAModelClass.from_pretrained(MODEL_NAME, **model_kwargs)
+model = OpenVLAModelClass.from_pretrained(
+    MODEL_SOURCE,
+    local_files_only=True,
+    **model_kwargs,
+)
 
 # Load processor
 processor = AutoProcessor.from_pretrained(
-    MODEL_NAME,
+    MODEL_SOURCE,
     trust_remote_code=True,
+    local_files_only=True,
 )
 
 print(f"✅ Model loaded on {next(model.parameters()).device}")

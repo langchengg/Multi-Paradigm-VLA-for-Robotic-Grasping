@@ -194,6 +194,14 @@ ACTIVE_TRANSLATION_CM = DROID_ACTIVE_TRANSLATION_CM_DEFAULT
 ACTIVE_ROTATION_DEG = DROID_ACTIVE_ROTATION_DEG_DEFAULT
 
 OPENVLA_BASE_MODEL = "openvla/openvla-7b"
+HF_TOKEN = (
+    os.environ.get("HF_TOKEN")
+    or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+)
+OPENVLA_LOCAL_DIR = os.environ.get("OPENVLA_LOCAL_DIR", "/kaggle/working/openvla-base")
+HF_DOWNLOAD_RETRIES = 6
+HF_DOWNLOAD_BACKOFF_S = 2.0
 OPENVLA_CANDIDATE_DIRS = [
     "/kaggle/input/openvla-finetuned/final",
     "/kaggle/input/openvla-finetuned/openvla-finetuned/final",
@@ -221,6 +229,41 @@ print(
 )
 print(f"   Action horizon: {ACTION_HORIZON}")
 print(f"   OpenVLA adapter dir: {OPENVLA_MODEL_DIR or 'not found yet'}")
+
+
+def snapshot_download_with_retry(repo_id, local_dir):
+    from huggingface_hub import snapshot_download
+
+    last_exc = None
+    for attempt in range(1, HF_DOWNLOAD_RETRIES + 1):
+        try:
+            return snapshot_download(
+                repo_id=repo_id,
+                local_dir=local_dir,
+                local_dir_use_symlinks=False,
+                token=HF_TOKEN,
+                resume_download=True,
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= HF_DOWNLOAD_RETRIES:
+                break
+            wait_s = HF_DOWNLOAD_BACKOFF_S * (2 ** (attempt - 1))
+            print(
+                f"  ⚠️ snapshot_download failed ({type(exc).__name__}: {exc}). "
+                f"Retrying in {wait_s:.1f}s [{attempt}/{HF_DOWNLOAD_RETRIES}]..."
+            )
+            time.sleep(wait_s)
+    token_hint = (
+        "Set Kaggle secret HF_TOKEN to an authenticated Hugging Face token to reduce 429 rate limits."
+        if not HF_TOKEN
+        else "HF_TOKEN was provided, but the Hub still refused the request."
+    )
+    raise RuntimeError(
+        f"Failed to cache {repo_id} after {HF_DOWNLOAD_RETRIES} attempts. {token_hint}"
+    ) from last_exc
 
 
 def format_vla_prompt(instruction):
@@ -1100,6 +1143,12 @@ class OpenVLAPolicyWrapper:
                 "`openvla-finetuned/final` to Notebook 3."
             )
 
+        if not HF_TOKEN:
+            print("  ⚠️ HF_TOKEN not set; Hugging Face rate limits may interrupt first-time model downloads.")
+        print(f"  Caching base model under: {OPENVLA_LOCAL_DIR}")
+        model_source = snapshot_download_with_retry(self.base_model_name, OPENVLA_LOCAL_DIR)
+        print(f"  ✅ Cached OpenVLA snapshot: {model_source}")
+
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=torch.cuda.is_available(),
             bnb_4bit_compute_dtype=torch.float16,
@@ -1118,9 +1167,17 @@ class OpenVLAPolicyWrapper:
         else:
             model_kwargs["torch_dtype"] = torch.float32
 
-        base_model = OpenVLAModelClass.from_pretrained(self.base_model_name, **model_kwargs)
+        base_model = OpenVLAModelClass.from_pretrained(
+            model_source,
+            local_files_only=True,
+            **model_kwargs,
+        )
         self.model = PeftModel.from_pretrained(base_model, self.adapter_dir)
-        self.processor = AutoProcessor.from_pretrained(self.adapter_dir, trust_remote_code=True)
+        self.processor = AutoProcessor.from_pretrained(
+            self.adapter_dir,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
         self.model.eval()
         if hasattr(self.model, "config"):
             self.model.config.use_cache = True
