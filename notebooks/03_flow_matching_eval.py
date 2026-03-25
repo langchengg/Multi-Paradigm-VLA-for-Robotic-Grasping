@@ -30,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 NUMPY_VERSION = "1.26.4"
@@ -94,7 +95,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 import matplotlib.pyplot as plt
 from torchvision import transforms
 from transformers import BertModel, BertTokenizer, ViTModel
@@ -104,6 +105,8 @@ from models.flow_matching_head import FlowMatchingHead
 from data.droid_utils import (
     ACTION_MAX,
     ACTION_MIN,
+    DROID_ACTIVE_ROTATION_DEG_DEFAULT,
+    DROID_ACTIVE_TRANSLATION_CM_DEFAULT,
     DROID_DEFAULT_FPS,
     DROID_FRAME_STRIDE_DEFAULT,
     DROID_MAX_FRAMES_PER_EPISODE_DEFAULT,
@@ -112,10 +115,13 @@ from data.droid_utils import (
     GRIPPER_OPEN_VALUE,
     ROTATION_STEP_RAD,
     TRANSLATION_STEP_M,
+    bucket_franka_action,
     droid_action_to_franka_action,
     droid_cartesian_velocity_to_franka_action,
     ensure_franka_action_7d,
+    franka_action_motion_metrics,
     image_to_uint8_array,
+    is_control_relevant_action,
     iter_droid_v30_stream,
     load_droid_info,
     load_droid_task_lookup,
@@ -162,7 +168,11 @@ MAX_SEQ_LEN = 256
 MAX_EVAL_SAMPLES = 200
 QUALITATIVE_EXAMPLES = 6
 GRIPPER_LOSS_WEIGHT = 3.0
-OPENVLA_MAX_NEW_TOKENS = 96
+OPENVLA_MAX_NEW_TOKENS = 24
+ACTION_BIN_SIZE = 0.05
+ACTION_BIN_LIMIT = int(round(ACTION_MAX / ACTION_BIN_SIZE))
+ACTIVE_TRANSLATION_CM = DROID_ACTIVE_TRANSLATION_CM_DEFAULT
+ACTIVE_ROTATION_DEG = DROID_ACTIVE_ROTATION_DEG_DEFAULT
 
 OPENVLA_BASE_MODEL = "openvla/openvla-7b"
 OPENVLA_CANDIDATE_DIRS = [
@@ -197,15 +207,26 @@ print(f"   OpenVLA adapter dir: {OPENVLA_MODEL_DIR or 'not found yet'}")
 def format_vla_prompt(instruction):
     return (
         f"In: What normalized Franka Panda delta-pose action should the robot take to {instruction}?\n"
-        "Out: Return dx dy dz dax day daz in [-1, 1] and gripper=open|close.\n"
-        f"dx dy dz are Cartesian deltas scaled by {TRANSLATION_STEP_M:.3f} m/step. "
-        f"dax day daz are angular deltas scaled by {ROTATION_STEP_RAD:.2f} rad/step. "
-        "Use gripper=close for positive commands and gripper=open for negative commands.\n"
+        f"Out: Return 7 compact tokens in order dx dy dz dax day daz grip. "
+        f"Use signed integer bins in [-{ACTION_BIN_LIMIT}, {ACTION_BIN_LIMIT}] where 1 bin = {ACTION_BIN_SIZE:.2f} normalized units. "
+        "Use 'c' for gripper=close and 'o' for gripper=open.\n"
+        f"Controller scale: xyz bins map to {TRANSLATION_STEP_M:.3f} m/step and rpy bins map to {ROTATION_STEP_RAD:.2f} rad/step.\n"
         "Action:"
     )
 
 
 FRANKA_ACTION_PATTERN = re.compile(
+    r"(?<!\S)"
+    r"(?P<dx>[+-]\d{2})\s+"
+    r"(?P<dy>[+-]\d{2})\s+"
+    r"(?P<dz>[+-]\d{2})\s+"
+    r"(?P<dax>[+-]\d{2})\s+"
+    r"(?P<day>[+-]\d{2})\s+"
+    r"(?P<daz>[+-]\d{2})\s+"
+    r"(?P<gripper>[oc])\b",
+    re.IGNORECASE,
+)
+FRANKA_LEGACY_ACTION_PATTERN = re.compile(
     r"dx=(?P<dx>[+-]?\d+(?:\.\d+)?)\s+"
     r"dy=(?P<dy>[+-]?\d+(?:\.\d+)?)\s+"
     r"dz=(?P<dz>[+-]?\d+(?:\.\d+)?)\s+"
@@ -222,6 +243,12 @@ FRANKA_GRIPPER_PATTERN = re.compile(r"\bgripper\s*=\s*(open|close)\b", re.IGNORE
 
 def parse_franka_action(text):
     match = FRANKA_ACTION_PATTERN.search(text)
+    if match is not None:
+        values = [int(match.group(key)) * ACTION_BIN_SIZE for key in FRANKA_ACTION_KEYS[:-1]]
+        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper").lower() == "c" else GRIPPER_OPEN_VALUE)
+        return ensure_franka_action_7d(values)
+
+    match = FRANKA_LEGACY_ACTION_PATTERN.search(text)
     if match is not None:
         values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
         values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
@@ -454,6 +481,124 @@ def compute_gripper_pos_weight(records):
     return pos_weight, float(gripper_closed.mean())
 
 
+def summarize_record_buckets(records):
+    counts = Counter(
+        bucket_franka_action(
+            record["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        for record in records
+    )
+    return dict(counts)
+
+
+def build_record_sampler(records):
+    bucket_counts = Counter(
+        bucket_franka_action(
+            record["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        for record in records
+    )
+    if not bucket_counts:
+        return None, {}
+
+    weights = []
+    for record in records:
+        bucket = bucket_franka_action(
+            record["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        weight = 1.0 / bucket_counts[bucket]
+        if bucket.endswith("active"):
+            weight *= 1.5
+        if bucket.startswith("close"):
+            weight *= 1.5
+        weights.append(weight)
+
+    weights = np.asarray(weights, dtype=np.float64)
+    weights /= weights.mean()
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(records),
+        replacement=True,
+    )
+    return sampler, dict(bucket_counts)
+
+
+def summarize_eval_distribution(records):
+    actions = np.stack([record["action_7d"] for record in records], axis=0)
+    zero_action = np.array(
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, GRIPPER_OPEN_VALUE],
+        dtype=np.float32,
+    )
+    diffs = actions - zero_action
+    zero_translation_mae_cm = float(
+        np.mean(np.mean(np.abs(diffs[:, :3]) * TRANSLATION_STEP_M * 100.0, axis=1))
+    )
+    zero_rotation_mae_deg = float(
+        np.mean(np.mean(np.abs(diffs[:, 3:6]) * ROTATION_STEP_RAD * 180.0 / np.pi, axis=1))
+    )
+    open_majority_accuracy = float(np.mean(actions[:, 6] <= 0))
+    control_relevant = [
+        is_control_relevant_action(
+            record["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        for record in records
+    ]
+    return {
+        "open_majority_accuracy": open_majority_accuracy,
+        "zero_action_translation_mae_cm": zero_translation_mae_cm,
+        "zero_action_rotation_mae_deg": zero_rotation_mae_deg,
+        "control_relevant_fraction": float(np.mean(control_relevant)),
+        "bucket_counts": summarize_record_buckets(records),
+    }
+
+
+def select_qualitative_records(records, max_examples):
+    """Prefer diverse active records so qualitative plots show real control behaviour."""
+    scored = []
+    for record in records:
+        metrics = franka_action_motion_metrics(record["action_7d"])
+        active = is_control_relevant_action(
+            record["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        score = (
+            float(active),
+            float(record["action_7d"][6] > 0),
+            metrics["translation_cm"] + metrics["rotation_deg"],
+        )
+        scored.append((score, record))
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    selected = []
+    seen_episodes = set()
+    for _, record in scored:
+        episode_index = record["episode_index"]
+        if episode_index not in seen_episodes or len(seen_episodes) >= max_examples:
+            selected.append(record)
+            seen_episodes.add(episode_index)
+        if len(selected) >= max_examples:
+            break
+
+    if len(selected) < max_examples:
+        existing = {id(record) for record in selected}
+        for _, record in scored:
+            if id(record) in existing:
+                continue
+            selected.append(record)
+            if len(selected) >= max_examples:
+                break
+    return selected
+
+
 class RealRobotActionDataset(Dataset):
     """Frame-level DROID dataset for offline one-step action prediction."""
 
@@ -487,13 +632,16 @@ ACTIVE_DROID_REPO, all_droid_records = load_real_droid_records(DROID_MAX_SAMPLES
 train_records, eval_records = split_records_by_episode(all_droid_records, DROID_EVAL_FRACTION)
 train_action_mean, train_action_std = compute_action_stats(train_records)
 train_gripper_pos_weight, train_gripper_close_rate = compute_gripper_pos_weight(train_records)
+train_sampler, train_bucket_counts = build_record_sampler(train_records)
+eval_diagnostics = summarize_eval_distribution(eval_records[: min(len(eval_records), MAX_EVAL_SAMPLES)])
 
 train_dataset = RealRobotActionDataset(train_records, img_size=IMAGE_SIZE)
 eval_dataset = RealRobotActionDataset(eval_records, img_size=IMAGE_SIZE)
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
-    shuffle=True,
+    shuffle=train_sampler is None,
+    sampler=train_sampler,
     collate_fn=collate_fn,
     num_workers=2,
     pin_memory=True,
@@ -505,6 +653,15 @@ print(
     f"   Train gripper close rate: {train_gripper_close_rate:.1%} "
     f"(BCE pos_weight={train_gripper_pos_weight:.2f})"
 )
+print(f"   Train action buckets: {train_bucket_counts}")
+print(
+    "   Eval diagnostics: "
+    f"open-majority={eval_diagnostics['open_majority_accuracy']:.1%}, "
+    f"zero-action={eval_diagnostics['zero_action_translation_mae_cm']:.2f} cm / "
+    f"{eval_diagnostics['zero_action_rotation_mae_deg']:.2f} deg, "
+    f"control-relevant={eval_diagnostics['control_relevant_fraction']:.1%}"
+)
+print(f"   Eval action buckets: {eval_diagnostics['bucket_counts']}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1032,6 +1189,9 @@ class OfflineRealDataEvaluator:
         normalized_l1s = []
         gripper_matches = []
         parse_failures = []
+        active_translation_errors = []
+        active_rotation_errors = []
+        active_gripper_matches = []
         examples = []
 
         for index, record in enumerate(subset):
@@ -1043,6 +1203,14 @@ class OfflineRealDataEvaluator:
             normalized_l1s.append(metrics["normalized_l1"])
             gripper_matches.append(metrics["gripper_accuracy"])
             parse_failures.append(float(info.get("parse_failed", False)))
+            if is_control_relevant_action(
+                record["action_7d"],
+                min_translation_cm=ACTIVE_TRANSLATION_CM,
+                min_rotation_deg=ACTIVE_ROTATION_DEG,
+            ):
+                active_translation_errors.append(metrics["translation_mae_cm"])
+                active_rotation_errors.append(metrics["rotation_mae_deg"])
+                active_gripper_matches.append(metrics["gripper_accuracy"])
 
             example = {
                 "sample_id": f"{record['episode_index']}-{record['frame_index']}",
@@ -1074,6 +1242,11 @@ class OfflineRealDataEvaluator:
             "avg_inference_ms": float(np.mean(latencies)),
             "p50_inference_ms": float(np.percentile(latencies, 50)),
             "p95_inference_ms": float(np.percentile(latencies, 95)),
+            "control_relevant_num_examples": int(len(active_translation_errors)),
+            "control_relevant_fraction": float(len(active_translation_errors) / max(len(subset), 1)),
+            "control_relevant_translation_mae_cm": float(np.mean(active_translation_errors)) if active_translation_errors else None,
+            "control_relevant_rotation_mae_deg": float(np.mean(active_rotation_errors)) if active_rotation_errors else None,
+            "control_relevant_gripper_accuracy": float(np.mean(active_gripper_matches)) if active_gripper_matches else None,
         }
         return {"summary": summary, "examples": examples}
 
@@ -1142,9 +1315,15 @@ comparison_summary = {
         "p50_inference_ms": float(result["summary"]["p50_inference_ms"]),
         "p95_inference_ms": float(result["summary"]["p95_inference_ms"]),
         "num_examples": int(result["summary"]["num_examples"]),
+        "control_relevant_num_examples": int(result["summary"]["control_relevant_num_examples"]),
+        "control_relevant_fraction": float(result["summary"]["control_relevant_fraction"]),
+        "control_relevant_translation_mae_cm": result["summary"]["control_relevant_translation_mae_cm"],
+        "control_relevant_rotation_mae_deg": result["summary"]["control_relevant_rotation_mae_deg"],
+        "control_relevant_gripper_accuracy": result["summary"]["control_relevant_gripper_accuracy"],
     }
     for name, result in comparison.items()
 }
+comparison_summary["_diagnostics"] = eval_diagnostics
 save_json(os.path.join(OUTPUT_DIR, "real_offline_summary.json"), comparison_summary)
 
 print("\n" + "=" * 78)
@@ -1201,7 +1380,7 @@ plt.close()
 
 
 def render_qualitative_examples(eval_records, comparison, output_path):
-    selected = eval_records[: min(QUALITATIVE_EXAMPLES, len(eval_records))]
+    selected = select_qualitative_records(eval_records, min(QUALITATIVE_EXAMPLES, len(eval_records)))
     row_height = 220
     canvas_width = 1200
     canvas = Image.new("RGB", (canvas_width, row_height * len(selected)), color="white")
@@ -1288,6 +1467,9 @@ report_lines = [
     f"- Eval frames: {min(len(eval_records), MAX_EVAL_SAMPLES)}",
     "- Robot platform: real Franka Panda data from DROID",
     "- Evaluation mode: offline one-step action prediction on held-out frames",
+    f"- Eval open-majority baseline: {eval_diagnostics['open_majority_accuracy']:.1%}",
+    f"- Eval zero-action baseline: {eval_diagnostics['zero_action_translation_mae_cm']:.2f} cm / {eval_diagnostics['zero_action_rotation_mae_deg']:.2f} deg",
+    f"- Control-relevant eval fraction: {eval_diagnostics['control_relevant_fraction']:.1%}",
     "",
     "## 3. Metrics",
     "- Translation MAE (cm): average absolute XYZ delta error after converting to this repo's control interface",
@@ -1306,6 +1488,13 @@ for name in ordered_names:
         f"- Gripper Accuracy: {summary['gripper_accuracy']:.1%}",
         f"- Parse Fail Rate: {summary['parse_fail_rate']:.1%}",
         f"- P50 Inference Latency: {summary['p50_inference_ms']:.1f} ms",
+        (
+            f"- Control-Relevant Subset: {summary['control_relevant_translation_mae_cm']:.2f} cm / "
+            f"{summary['control_relevant_rotation_mae_deg']:.2f} deg / "
+            f"{summary['control_relevant_gripper_accuracy']:.1%}"
+            if summary['control_relevant_translation_mae_cm'] is not None
+            else "- Control-Relevant Subset: n/a"
+        ),
         "",
     ])
 
@@ -1314,6 +1503,7 @@ report_lines.extend([
     f"- Best translation error: {display_names[best_translation_name]} ({comparison_summary[best_translation_name]['translation_mae_cm']:.2f} cm)",
     f"- Best gripper accuracy: {display_names[best_gripper_name]} ({comparison_summary[best_gripper_name]['gripper_accuracy']:.1%})",
     f"- Fastest inference: {display_names[fastest_name]} ({comparison_summary[fastest_name]['p50_inference_ms']:.1f} ms p50)",
+    "- Interpret gripper results relative to the eval open-majority baseline above; a model that mostly emits open can look deceptively good on idle-heavy splits.",
     "",
     "## 6. Output Files",
     "- flow_matching_vla.pt",

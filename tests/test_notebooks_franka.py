@@ -39,6 +39,7 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert 'DROID_EVAL_FRACTION = 0.2' in source
     assert 'DROID_FPS = DROID_DEFAULT_FPS' in source
     assert 'ACTION_HORIZON = 1' in source
+    assert 'ACTION_BIN_SIZE = 0.05' in source
     assert 'VLA_SKIP_INSTALL' in source
     assert 'skipped dependency installation' in source
     assert '"av>=12.0.0"' in source
@@ -57,6 +58,11 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "gripper_loss = F.binary_cross_entropy_with_logits(" in source
     assert "actions = self.flow_head.sample(features, num_steps=steps)" in source
     assert "def load_real_droid_records(max_samples):" in source
+    assert "def build_record_sampler(records):" in source
+    assert "WeightedRandomSampler" in source
+    assert "def summarize_eval_distribution(records):" in source
+    assert 'comparison_summary["_diagnostics"] = eval_diagnostics' in source
+    assert "def select_qualitative_records(records, max_examples):" in source
     assert 'image = sample_get(sample, "decoded_image")' in source
     assert 'sample_get(sample, "decode_error")' in source
     assert '"episode_instruction",' in source
@@ -72,6 +78,7 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "self.input_dtype = next(self.model.parameters()).dtype" in source
     assert "if torch.is_floating_point(value):" in source
     assert "dtype=self.input_dtype" in source
+    assert "self.model.config.use_cache = True" in source
     assert "VLAMuJoCoEvaluator" not in source
     assert "FrankaGraspEnv" not in source
     assert 'comparison["autoregressive"] = evaluate_policy_offline("autoregressive", openvla_policy, eval_records)' in source

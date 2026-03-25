@@ -90,7 +90,11 @@ def test_openvla_notebook_supervises_structured_franka_delta_pose_targets():
     assert "ROTATION_STEP_RAD," in source
     assert "def format_franka_action(action):" in source
     assert "def parse_franka_action(text):" in source
-    assert 'gripper=open|close' in source
+    assert 'ACTION_BIN_SIZE = 0.05' in source
+    assert '"action_encoding": "compact_integer_bins_v1"' in source
+    assert '"+06 -03 +00 +02 -11 +00 o"' in source
+    assert "WeightedRandomSampler" in source
+    assert "def build_training_sampler(samples):" in source
     assert 'outputs = model(**inputs)' in source
     assert 'labels=inputs["input_ids"]' not in source
     assert 'labels[i, :prompt_len] = -100' in source

@@ -28,6 +28,8 @@ DROID_DEFAULT_FPS = 15.0
 DROID_FRAME_STRIDE_DEFAULT = 8
 DROID_MAX_FRAMES_PER_EPISODE_DEFAULT = 64
 DROID_GRIPPER_VELOCITY_EPS = 1e-3
+DROID_ACTIVE_TRANSLATION_CM_DEFAULT = 0.25
+DROID_ACTIVE_ROTATION_DEG_DEFAULT = 0.5
 DROID_CAMERA_KEYS = (
     "observation.images.exterior_1_left",
     "observation.images.exterior_2_left",
@@ -42,6 +44,8 @@ __all__ = [
     "DROID_FRAME_STRIDE_DEFAULT",
     "DROID_GRIPPER_VELOCITY_EPS",
     "DROID_MAX_FRAMES_PER_EPISODE_DEFAULT",
+    "DROID_ACTIVE_ROTATION_DEG_DEFAULT",
+    "DROID_ACTIVE_TRANSLATION_CM_DEFAULT",
     "FRANKA_ACTION_KEYS",
     "GRIPPER_CLOSE_VALUE",
     "GRIPPER_OPEN_VALUE",
@@ -56,6 +60,9 @@ __all__ = [
     "load_droid_info",
     "load_droid_task_lookup",
     "sample_get",
+    "bucket_franka_action",
+    "franka_action_motion_metrics",
+    "is_control_relevant_action",
     "select_droid_frame",
     "select_droid_gripper_command",
 ]
@@ -92,6 +99,63 @@ def gripper_value_to_binary_command(
     if 0.0 <= scalar <= 1.0:
         return gripper_close_value if scalar >= 0.5 else gripper_open_value
     return gripper_close_value if scalar > 0.0 else gripper_open_value
+
+
+def franka_action_motion_metrics(
+    action,
+    *,
+    translation_step_m=TRANSLATION_STEP_M,
+    rotation_step_rad=ROTATION_STEP_RAD,
+):
+    """Return physical motion magnitudes for a normalized 7-DOF Franka action."""
+    action = ensure_franka_action_7d(action)
+    translation_cm = float(np.mean(np.abs(action[:3]) * translation_step_m * 100.0))
+    rotation_deg = float(np.mean(np.abs(action[3:6]) * rotation_step_rad * 180.0 / np.pi))
+    return {
+        "translation_cm": translation_cm,
+        "rotation_deg": rotation_deg,
+        "gripper_close": bool(action[6] > 0.0),
+    }
+
+
+def is_control_relevant_action(
+    action,
+    *,
+    min_translation_cm=DROID_ACTIVE_TRANSLATION_CM_DEFAULT,
+    min_rotation_deg=DROID_ACTIVE_ROTATION_DEG_DEFAULT,
+):
+    """
+    Flag actions that contain meaningful control content.
+
+    Offline real-data splits are often dominated by low-motion open-gripper frames.
+    Those frames are useful for coverage, but they should not dominate either training
+    or qualitative inspection because a zero/open policy scores surprisingly well on
+    them. We treat close commands as control-relevant even when motion is small because
+    the gripper decision itself matters.
+    """
+    metrics = franka_action_motion_metrics(action)
+    return bool(
+        metrics["translation_cm"] >= min_translation_cm
+        or metrics["rotation_deg"] >= min_rotation_deg
+        or metrics["gripper_close"]
+    )
+
+
+def bucket_franka_action(
+    action,
+    *,
+    min_translation_cm=DROID_ACTIVE_TRANSLATION_CM_DEFAULT,
+    min_rotation_deg=DROID_ACTIVE_ROTATION_DEG_DEFAULT,
+):
+    """Bucket an action into open/close × idle/active for rebalancing and reporting."""
+    metrics = franka_action_motion_metrics(action)
+    active = (
+        metrics["translation_cm"] >= min_translation_cm
+        or metrics["rotation_deg"] >= min_rotation_deg
+    )
+    gripper_name = "close" if metrics["gripper_close"] else "open"
+    motion_name = "active" if active else "idle"
+    return f"{gripper_name}_{motion_name}"
 
 
 def select_droid_gripper_command(

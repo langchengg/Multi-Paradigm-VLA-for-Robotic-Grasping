@@ -81,6 +81,7 @@ install()
 
 import os
 import torch
+from collections import Counter
 
 # ──── Paths & Data Sources ────
 PROJECT_ROOT = Path(__file__).resolve().parents[1] if "__file__" in globals() else Path.cwd()
@@ -90,6 +91,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from data.droid_utils import (
     ACTION_MAX,
     ACTION_MIN,
+    DROID_ACTIVE_ROTATION_DEG_DEFAULT,
+    DROID_ACTIVE_TRANSLATION_CM_DEFAULT,
     DROID_DEFAULT_FPS,
     DROID_FRAME_STRIDE_DEFAULT,
     DROID_MAX_FRAMES_PER_EPISODE_DEFAULT,
@@ -98,10 +101,13 @@ from data.droid_utils import (
     GRIPPER_OPEN_VALUE,
     ROTATION_STEP_RAD,
     TRANSLATION_STEP_M,
+    bucket_franka_action,
     droid_action_to_franka_action,
     droid_cartesian_velocity_to_franka_action,
     ensure_franka_action_7d,
+    franka_action_motion_metrics,
     image_to_uint8_array,
+    is_control_relevant_action,
     iter_droid_v30_stream,
     load_droid_task_lookup,
     load_droid_info,
@@ -141,7 +147,11 @@ IMAGE_SIZE = 224                  # OpenVLA input resolution
 MAX_SEQ_LEN = 256
 SAVE_STEPS = 200
 LOG_STEPS = 10
-OPENVLA_MAX_NEW_TOKENS = 96
+OPENVLA_MAX_NEW_TOKENS = 24
+ACTION_BIN_SIZE = 0.05
+ACTION_BIN_LIMIT = int(round(ACTION_MAX / ACTION_BIN_SIZE))
+ACTIVE_TRANSLATION_CM = DROID_ACTIVE_TRANSLATION_CM_DEFAULT
+ACTIVE_ROTATION_DEG = DROID_ACTIVE_ROTATION_DEG_DEFAULT
 
 print(f"✅ Config ready")
 print(f"   Model: {MODEL_NAME}")
@@ -181,19 +191,32 @@ def franka_action_to_physical_delta(action):
 
 def format_franka_action(action):
     """
-    Serialize a normalized Franka delta-pose action as a compact supervision target.
+    Serialize a normalized Franka delta-pose action as compact discrete bins.
 
-    The first 6 dimensions remain normalized to [-1, 1] to match the demos.
-    The gripper is emitted as open/close because the environment uses its sign only.
+    OpenVLA is a text generator, so forcing it to emit long floating-point strings makes
+    one-step control both slow and brittle. Short integer bins are easier to learn, faster
+    to decode, and still precise enough for this repo's 3 cm / 0.05 rad control scale.
     """
     action = ensure_franka_action_7d(action)
-    gripper_cmd = "close" if action[6] > 0 else "open"
-    values = [f"{key}={action[idx]:+.3f}" for idx, key in enumerate(FRANKA_ACTION_KEYS[:-1])]
-    values.append(f"gripper={gripper_cmd}")
+    bins = np.clip(np.round(action[:6] / ACTION_BIN_SIZE), -ACTION_BIN_LIMIT, ACTION_BIN_LIMIT).astype(int)
+    gripper_cmd = "c" if action[6] > 0 else "o"
+    values = [f"{value:+03d}" for value in bins.tolist()]
+    values.append(gripper_cmd)
     return " ".join(values)
 
 
 FRANKA_ACTION_PATTERN = re.compile(
+    r"(?<!\S)"
+    r"(?P<dx>[+-]\d{2})\s+"
+    r"(?P<dy>[+-]\d{2})\s+"
+    r"(?P<dz>[+-]\d{2})\s+"
+    r"(?P<dax>[+-]\d{2})\s+"
+    r"(?P<day>[+-]\d{2})\s+"
+    r"(?P<daz>[+-]\d{2})\s+"
+    r"(?P<gripper>[oc])\b",
+    re.IGNORECASE,
+)
+FRANKA_LEGACY_ACTION_PATTERN = re.compile(
     r"dx=(?P<dx>[+-]?\d+(?:\.\d+)?)\s+"
     r"dy=(?P<dy>[+-]?\d+(?:\.\d+)?)\s+"
     r"dz=(?P<dz>[+-]?\d+(?:\.\d+)?)\s+"
@@ -215,6 +238,12 @@ FRANKA_VECTOR_PATTERN = re.compile(
 def parse_franka_action(text):
     """Parse the generated textual action back into the env's normalized 7-DOF control."""
     match = FRANKA_ACTION_PATTERN.search(text)
+    if match is not None:
+        values = [int(match.group(key)) * ACTION_BIN_SIZE for key in FRANKA_ACTION_KEYS[:-1]]
+        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper").lower() == "c" else GRIPPER_OPEN_VALUE)
+        return ensure_franka_action_7d(values)
+
+    match = FRANKA_LEGACY_ACTION_PATTERN.search(text)
     if match is not None:
         values = [float(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
         values.append(GRIPPER_CLOSE_VALUE if match.group("gripper") == "close" else GRIPPER_OPEN_VALUE)
@@ -253,10 +282,10 @@ def format_vla_prompt(instruction):
     """Describe the exact Franka end-effector control interface expected from the model."""
     return (
         f"In: What normalized Franka Panda delta-pose action should the robot take to {instruction}?\n"
-        "Out: Return dx dy dz dax day daz in [-1, 1] and gripper=open|close.\n"
-        f"dx dy dz are Cartesian deltas scaled by {TRANSLATION_STEP_M:.3f} m/step. "
-        f"dax day daz are angular deltas scaled by {ROTATION_STEP_RAD:.2f} rad/step. "
-        "Use gripper=close for positive commands and gripper=open for negative commands.\n"
+        f"Out: Return 7 compact tokens in order dx dy dz dax day daz grip. "
+        f"Use signed integer bins in [-{ACTION_BIN_LIMIT}, {ACTION_BIN_LIMIT}] where 1 bin = {ACTION_BIN_SIZE:.2f} normalized units. "
+        "Use 'c' for gripper=close and 'o' for gripper=open.\n"
+        f"Controller scale: xyz bins map to {TRANSLATION_STEP_M:.3f} m/step and rpy bins map to {ROTATION_STEP_RAD:.2f} rad/step.\n"
         "Action:"
     )
 
@@ -308,12 +337,15 @@ def save_franka_action_metadata(save_dir):
         "normalized_range": [ACTION_MIN, ACTION_MAX],
         "translation_step_m": TRANSLATION_STEP_M,
         "rotation_step_rad": ROTATION_STEP_RAD,
-        "gripper_semantics": {
-            "negative": "open",
-            "positive": "close",
-        },
-        "target_format": "dx=... dy=... dz=... dax=... day=... daz=... gripper=open|close",
-    }
+            "action_encoding": "compact_integer_bins_v1",
+            "action_bin_size": ACTION_BIN_SIZE,
+            "action_bin_limit": ACTION_BIN_LIMIT,
+            "gripper_semantics": {
+                "negative": "open",
+                "positive": "close",
+            },
+            "target_format": "+06 -03 +00 +02 -11 +00 o",
+        }
     with open(os.path.join(save_dir, "franka_action_config.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -322,7 +354,7 @@ def save_franka_action_metadata(save_dir):
 # ═══════════════════════════════════════════════════════════════
 
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from PIL import Image
 import glob
 
@@ -603,6 +635,69 @@ def collate_vla_batch(batch):
     }
 
 
+def summarize_action_buckets(samples):
+    counts = Counter()
+    for sample in samples:
+        counts[bucket_franka_action(
+            sample["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )] += 1
+    return dict(counts)
+
+
+def build_training_sampler(samples):
+    """
+    Rebalance open/close and idle/active buckets so the model does not collapse to
+    the dominant open-idle behaviour that appears early in DROID.
+    """
+    bucket_counts = Counter(
+        bucket_franka_action(
+            sample["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        for sample in samples
+    )
+    if not bucket_counts:
+        return None, {}
+
+    weights = []
+    for sample in samples:
+        bucket = bucket_franka_action(
+            sample["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
+        weight = 1.0 / bucket_counts[bucket]
+        if bucket.endswith("active"):
+            weight *= 1.5
+        if bucket.startswith("close"):
+            weight *= 1.5
+        weights.append(weight)
+
+    weights = np.asarray(weights, dtype=np.float64)
+    weights /= weights.mean()
+    sampler = WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(samples),
+        replacement=True,
+    )
+    return sampler, dict(bucket_counts)
+
+
+def select_preview_sample(dataset):
+    """Prefer an active or close-gripper sample for the end-of-training smoke test."""
+    for sample in dataset.samples:
+        if is_control_relevant_action(
+            sample["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        ):
+            return sample
+    return dataset.samples[0]
+
+
 # Test dataset
 dataset = VLADemoDataset(
     DEMO_DIR,
@@ -612,6 +707,7 @@ dataset = VLADemoDataset(
 )
 print(f"  Total Dataset size: {len(dataset)} samples")
 print(f"  Source counts: {dataset.source_counts}")
+print(f"  Action buckets: {summarize_action_buckets(dataset.samples)}")
 sample = dataset[0]
 print(f"  Sample image: {sample['image'].size}")
 print(f"  Sample instruction: '{sample['instruction']}'")
@@ -710,10 +806,14 @@ optimizer = AdamW(
     weight_decay=0.01,
 )
 
+train_sampler, train_bucket_counts = build_training_sampler(dataset.samples)
+print(f"  Rebalanced training buckets: {train_bucket_counts}")
+
 dataloader = DataLoader(
     dataset,
     batch_size=BATCH_SIZE,
-    shuffle=True,
+    shuffle=train_sampler is None,
+    sampler=train_sampler,
     num_workers=2,
     pin_memory=True,
     drop_last=True,
@@ -821,8 +921,10 @@ model.eval()
 if hasattr(model, "config"):
     model.config.use_cache = True
 
-test_image = dataset[0]["image"]
-test_instruction = dataset[0]["instruction"]
+preview_sample = select_preview_sample(dataset)
+test_image = Image.fromarray(preview_sample["image"]).resize((IMAGE_SIZE, IMAGE_SIZE), Image.BILINEAR)
+test_instruction = preview_sample["instruction"]
+test_target_action = preview_sample["action_7d"]
 
 prompt = format_vla_prompt(test_instruction)
 raw_inputs = processor(
@@ -855,7 +957,7 @@ parsed_action = parse_franka_action(generated_text)
 print(f"\n🔎 Inference test:")
 print(f"   Instruction: '{test_instruction}'")
 print(f"   Generated text: {generated_text}")
-print(f"   Ground-truth target: {format_franka_action(dataset[0]['action'].numpy())}")
+print(f"   Ground-truth target: {format_franka_action(test_target_action)}")
 if parsed_action is not None:
     print(f"   Parsed action (normalized): {parsed_action}")
     print(f"   Parsed action (physical): {format_physical_delta(parsed_action)}")
