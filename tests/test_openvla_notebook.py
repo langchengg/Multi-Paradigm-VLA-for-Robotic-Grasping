@@ -14,6 +14,7 @@ def test_openvla_notebook_pins_compatible_transformers_stack():
     assert 'f"numpy=={NUMPY_VERSION}"' in source
     assert "def verify_torch_numpy_bridge():" in source
     assert "torch.tensor([1.0]).numpy()" in source
+    assert "def verify_runtime_versions():" in source
     assert "LOG_STEPS = 10" in source
     assert 'model.config.use_cache = False' in source
     assert 'if global_step % LOG_STEPS == 0:' in source
@@ -32,6 +33,7 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert '"cadene/droid_1.0.1_v30"' in source
     assert "DROID_MAX_SAMPLES = 500" in source
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
+    assert "DROID_KEEP_IDLE_OPEN_PROB = 0.35" in source
     assert "NUM_EPOCHS = 1" in source
     assert '"av>=12.0.0"' in source
     assert '"opencv-python-headless>=4.9.0"' in source
@@ -95,6 +97,8 @@ def test_openvla_notebook_supervises_structured_franka_delta_pose_targets():
     assert '"+06 -03 +00 +02 -11 +00 o"' in source
     assert "WeightedRandomSampler" in source
     assert "def build_training_sampler(samples):" in source
+    assert "model_dtype" in source
+    assert "dtype=model_dtype" in source
     assert 'outputs = model(**inputs)' in source
     assert 'labels=inputs["input_ids"]' not in source
     assert 'labels[i, :prompt_len] = -100' in source

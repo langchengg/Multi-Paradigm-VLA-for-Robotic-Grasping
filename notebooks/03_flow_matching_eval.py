@@ -55,9 +55,27 @@ def verify_torch_numpy_bridge():
     print(f"✅ Verified torch↔numpy bridge ({output})")
 
 
+def verify_runtime_versions():
+    import importlib.metadata as importlib_metadata
+
+    expected_versions = {
+        "torch": "2.2.0",
+        "torchvision": "0.17.0",
+        "transformers": "4.40.1",
+        "tokenizers": "0.19.1",
+        "accelerate": "0.30.1",
+        "peft": "0.11.1",
+    }
+    for pkg, expected in expected_versions.items():
+        actual = importlib_metadata.version(pkg)
+        if actual != expected:
+            raise RuntimeError(f"Expected {pkg}=={expected}, found {actual}")
+
+
 def install():
     if os.environ.get("VLA_SKIP_INSTALL", "").strip().lower() in {"1", "true", "yes", "on"}:
         verify_torch_numpy_bridge()
+        verify_runtime_versions()
         print("✅ Reusing existing environment; skipped dependency installation")
         return
 
@@ -81,6 +99,7 @@ def install():
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
     verify_torch_numpy_bridge()
+    verify_runtime_versions()
     print("✅ Dependencies installed")
 
 
@@ -1171,6 +1190,8 @@ def compute_prediction_metrics(pred_action, target_action):
         "rotation_mae_deg": rotation_mae_deg,
         "gripper_accuracy": gripper_accuracy,
         "normalized_l1": normalized_l1,
+        "pred_gripper_close": bool(pred_action[6] > 0),
+        "target_gripper_close": bool(target_action[6] > 0),
     }
 
 
@@ -1192,6 +1213,10 @@ class OfflineRealDataEvaluator:
         active_translation_errors = []
         active_rotation_errors = []
         active_gripper_matches = []
+        gripper_tp = 0
+        gripper_tn = 0
+        gripper_fp = 0
+        gripper_fn = 0
         examples = []
 
         for index, record in enumerate(subset):
@@ -1203,6 +1228,14 @@ class OfflineRealDataEvaluator:
             normalized_l1s.append(metrics["normalized_l1"])
             gripper_matches.append(metrics["gripper_accuracy"])
             parse_failures.append(float(info.get("parse_failed", False)))
+            if metrics["pred_gripper_close"] and metrics["target_gripper_close"]:
+                gripper_tp += 1
+            elif (not metrics["pred_gripper_close"]) and (not metrics["target_gripper_close"]):
+                gripper_tn += 1
+            elif metrics["pred_gripper_close"] and (not metrics["target_gripper_close"]):
+                gripper_fp += 1
+            else:
+                gripper_fn += 1
             if is_control_relevant_action(
                 record["action_7d"],
                 min_translation_cm=ACTIVE_TRANSLATION_CM,
@@ -1232,12 +1265,17 @@ class OfflineRealDataEvaluator:
                     f"gripper acc={np.mean(gripper_matches):.1%}"
                 )
 
+        gripper_tpr = gripper_tp / max(gripper_tp + gripper_fn, 1)
+        gripper_tnr = gripper_tn / max(gripper_tn + gripper_fp, 1)
         summary = {
             "num_examples": int(len(subset)),
             "translation_mae_cm": float(np.mean(translation_errors)),
             "rotation_mae_deg": float(np.mean(rotation_errors)),
             "normalized_l1": float(np.mean(normalized_l1s)),
             "gripper_accuracy": float(np.mean(gripper_matches)),
+            "gripper_balanced_accuracy": float(0.5 * (gripper_tpr + gripper_tnr)),
+            "gripper_tpr": float(gripper_tpr),
+            "gripper_tnr": float(gripper_tnr),
             "parse_fail_rate": float(np.mean(parse_failures)),
             "avg_inference_ms": float(np.mean(latencies)),
             "p50_inference_ms": float(np.percentile(latencies, 50)),
@@ -1310,6 +1348,9 @@ comparison_summary = {
         "rotation_mae_deg": float(result["summary"]["rotation_mae_deg"]),
         "normalized_l1": float(result["summary"]["normalized_l1"]),
         "gripper_accuracy": float(result["summary"]["gripper_accuracy"]),
+        "gripper_balanced_accuracy": float(result["summary"]["gripper_balanced_accuracy"]),
+        "gripper_tpr": float(result["summary"]["gripper_tpr"]),
+        "gripper_tnr": float(result["summary"]["gripper_tnr"]),
         "parse_fail_rate": float(result["summary"]["parse_fail_rate"]),
         "avg_inference_ms": float(result["summary"]["avg_inference_ms"]),
         "p50_inference_ms": float(result["summary"]["p50_inference_ms"]),
@@ -1329,25 +1370,26 @@ save_json(os.path.join(OUTPUT_DIR, "real_offline_summary.json"), comparison_summ
 print("\n" + "=" * 78)
 print("OFFLINE REAL-DATA COMPARISON TABLE")
 print("=" * 78)
-print(f"{'Decoder':<20} {'Trans(cm)':>10} {'Rot(deg)':>10} {'Grip Acc':>10} {'P50(ms)':>10}")
+print(f"{'Decoder':<20} {'Trans(cm)':>10} {'Rot(deg)':>10} {'Grip Bal':>10} {'P50(ms)':>10}")
 print("-" * 70)
 for name in ordered_names:
-    summary = comparison_summary[name]
-    print(
-        f"{display_names[name]:<20} {summary['translation_mae_cm']:>10.2f} "
-        f"{summary['rotation_mae_deg']:>10.2f} {summary['gripper_accuracy']:>9.0%} "
-        f"{summary['p50_inference_ms']:>10.1f}"
-    )
+        summary = comparison_summary[name]
+        print(
+            f"{display_names[name]:<20} {summary['translation_mae_cm']:>10.2f} "
+            f"{summary['rotation_mae_deg']:>10.2f} {summary['gripper_balanced_accuracy']:>9.0%} "
+            f"{summary['p50_inference_ms']:>10.1f}"
+        )
 print("=" * 78)
 
 with open(os.path.join(OUTPUT_DIR, "real_offline_table.md"), "w") as f:
-    f.write("| Decoder | Translation MAE (cm) | Rotation MAE (deg) | Gripper Accuracy | P50 Latency |\n")
-    f.write("|---|---:|---:|---:|---:|\n")
+    f.write("| Decoder | Translation MAE (cm) | Rotation MAE (deg) | Gripper Acc | Gripper Bal Acc | P50 Latency |\n")
+    f.write("|---|---:|---:|---:|---:|---:|\n")
     for name in ordered_names:
         summary = comparison_summary[name]
         f.write(
             f"| {display_names[name]} | {summary['translation_mae_cm']:.2f} | "
             f"{summary['rotation_mae_deg']:.2f} | {summary['gripper_accuracy']:.1%} | "
+            f"{summary['gripper_balanced_accuracy']:.1%} | "
             f"{summary['p50_inference_ms']:.1f} ms |\n"
         )
 
@@ -1475,6 +1517,7 @@ report_lines = [
     "- Translation MAE (cm): average absolute XYZ delta error after converting to this repo's control interface",
     "- Rotation MAE (deg): average absolute roll/pitch/yaw delta error",
     "- Gripper Accuracy: binary open/close agreement",
+    "- Gripper Balanced Accuracy: average of close recall and open recall",
     "- P50 Latency: median inference latency per frame",
     "",
     "## 4. Results",
@@ -1486,6 +1529,7 @@ for name in ordered_names:
         f"- Translation MAE: {summary['translation_mae_cm']:.2f} cm",
         f"- Rotation MAE: {summary['rotation_mae_deg']:.2f} deg",
         f"- Gripper Accuracy: {summary['gripper_accuracy']:.1%}",
+        f"- Gripper Balanced Accuracy: {summary['gripper_balanced_accuracy']:.1%}",
         f"- Parse Fail Rate: {summary['parse_fail_rate']:.1%}",
         f"- P50 Inference Latency: {summary['p50_inference_ms']:.1f} ms",
         (

@@ -40,6 +40,7 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert 'DROID_FPS = DROID_DEFAULT_FPS' in source
     assert 'ACTION_HORIZON = 1' in source
     assert 'ACTION_BIN_SIZE = 0.05' in source
+    assert "def verify_runtime_versions():" in source
     assert 'VLA_SKIP_INSTALL' in source
     assert 'skipped dependency installation' in source
     assert '"av>=12.0.0"' in source
@@ -62,6 +63,8 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "WeightedRandomSampler" in source
     assert "def summarize_eval_distribution(records):" in source
     assert 'comparison_summary["_diagnostics"] = eval_diagnostics' in source
+    assert '"gripper_balanced_accuracy": float(result["summary"]["gripper_balanced_accuracy"])' in source
+    assert "Gripper Balanced Accuracy" in source
     assert "def select_qualitative_records(records, max_examples):" in source
     assert 'image = sample_get(sample, "decoded_image")' in source
     assert 'sample_get(sample, "decode_error")' in source

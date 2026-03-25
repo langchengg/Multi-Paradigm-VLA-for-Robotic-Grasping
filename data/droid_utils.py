@@ -9,6 +9,8 @@ These helpers keep Notebook 2 and Notebook 3 aligned on the same:
 
 import io
 import json
+import os
+import time
 from collections import OrderedDict
 from functools import lru_cache
 
@@ -30,6 +32,8 @@ DROID_MAX_FRAMES_PER_EPISODE_DEFAULT = 64
 DROID_GRIPPER_VELOCITY_EPS = 1e-3
 DROID_ACTIVE_TRANSLATION_CM_DEFAULT = 0.25
 DROID_ACTIVE_ROTATION_DEG_DEFAULT = 0.5
+HF_RETRY_ATTEMPTS = 4
+HF_RETRY_BACKOFF_S = 1.5
 DROID_CAMERA_KEYS = (
     "observation.images.exterior_1_left",
     "observation.images.exterior_2_left",
@@ -87,6 +91,22 @@ def ensure_franka_action_7d(
         f"Unsupported action dimension {action.shape[0]} in {source_name}. "
         "Expected 7-DOF Franka actions or legacy 4-DOF actions."
     )
+
+
+def _retry_hf_call(fn, *, attempts=HF_RETRY_ATTEMPTS, backoff_s=HF_RETRY_BACKOFF_S):
+    """Retry transient Hub / streaming operations with exponential backoff."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                raise
+            time.sleep(backoff_s * (2 ** (attempt - 1)))
+    raise last_exc
 
 
 def gripper_value_to_binary_command(
@@ -387,10 +407,12 @@ def load_droid_task_lookup(repo_id):
     from huggingface_hub import hf_hub_download
 
     try:
-        tasks_path = hf_hub_download(
-            repo_id=repo_id,
-            repo_type="dataset",
-            filename="meta/tasks.jsonl",
+        tasks_path = _retry_hf_call(
+            lambda: hf_hub_download(
+                repo_id=repo_id,
+                repo_type="dataset",
+                filename="meta/tasks.jsonl",
+            )
         )
     except Exception:
         return {}
@@ -417,10 +439,12 @@ def load_droid_info(repo_id):
     """Load DROID dataset metadata required to resolve video-backed image streams."""
     from huggingface_hub import hf_hub_download
 
-    info_path = hf_hub_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        filename="meta/info.json",
+    info_path = _retry_hf_call(
+        lambda: hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename="meta/info.json",
+        )
     )
     with open(info_path, "r") as f:
         return json.load(f)
@@ -435,7 +459,9 @@ def _list_droid_data_files(repo_id):
     return tuple(
         sorted(
             file_name
-            for file_name in api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+            for file_name in _retry_hf_call(
+                lambda: api.list_repo_files(repo_id=repo_id, repo_type="dataset")
+            )
             if file_name.startswith("data/") and file_name.endswith(".parquet")
         )
     )
@@ -446,10 +472,12 @@ def _load_droid_episode_rows(repo_id, meta_file):
     """Load per-file episode metadata rows used to map frame rows to MP4 shards."""
     from huggingface_hub import hf_hub_download
 
-    meta_path = hf_hub_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        filename=meta_file,
+    meta_path = _retry_hf_call(
+        lambda: hf_hub_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            filename=meta_file,
+        )
     )
     return tuple(pq.read_table(meta_path).to_pylist())
 
@@ -479,6 +507,7 @@ class _OpenCVVideoCache:
 
         cap = self._caps.pop(video_path, None)
         if cap is None:
+            os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;none")
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 raise ValueError(f"Failed to open DROID video file: {video_path}")
@@ -607,6 +636,7 @@ def iter_droid_v30_stream(
 
     reader = _OpenCVVideoCache(max_open=max_open_videos)
     yielded = 0
+    yielded_keys = set()
 
     try:
         for data_file in data_files:
@@ -615,77 +645,84 @@ def iter_droid_v30_stream(
             if not episode_rows:
                 continue
 
-            local_episode_idx = -1
-            data_stream = load_dataset(
-                repo_id,
-                split=split,
-                streaming=True,
-                data_files=data_file,
-            )
-
-            for sample in data_stream:
-                if sample_get(sample, "is_first"):
-                    local_episode_idx += 1
-                if local_episode_idx < 0 or local_episode_idx >= len(episode_rows):
-                    raise IndexError(
-                        f"DROID episode pointer {local_episode_idx} is out of bounds for {meta_file}"
-                    )
-
-                episode_row = episode_rows[local_episode_idx]
-                episode_instruction = _extract_episode_instruction(episode_row.get("tasks"))
-                if skip_unlabeled_episodes and episode_instruction is None:
-                    continue
-                frame_index = int(sample_get(sample, "frame_index") or 0)
-
-                image = None
-                last_error = None
-                used_camera = None
-                for camera_key in camera_keys:
-                    chunk_idx = episode_row.get(f"videos/{camera_key}/chunk_index")
-                    file_idx = episode_row.get(f"videos/{camera_key}/file_index")
-                    from_ts = episode_row.get(f"videos/{camera_key}/from_timestamp")
-                    if chunk_idx is None or file_idx is None or from_ts is None:
-                        continue
-
-                    absolute_frame = int(round(float(from_ts) * fps)) + frame_index
-                    video_file = video_path_template.format(
-                        video_key=camera_key,
-                        chunk_index=int(chunk_idx),
-                        file_index=int(file_idx),
-                    )
-                    try:
-                        local_video_path = hf_hub_download(
-                            repo_id=repo_id,
-                            repo_type="dataset",
-                            filename=video_file,
+            for stream_attempt in range(1, HF_RETRY_ATTEMPTS + 1):
+                local_episode_idx = -1
+                try:
+                    data_stream = _retry_hf_call(
+                        lambda: load_dataset(
+                            repo_id,
+                            split=split,
+                            streaming=True,
+                            data_files=data_file,
                         )
-                        image = reader.read_frame(local_video_path, absolute_frame)
-                        used_camera = camera_key
-                        break
-                    except Exception as exc:
-                        last_error = exc
+                    )
 
-                if image is None:
-                    out = dict(sample)
-                    out["observation.images.active_camera"] = None
-                    out["episode_instruction"] = episode_instruction
-                    out["decoded_image"] = None
-                    if last_error is not None:
-                        out["decode_error"] = f"{type(last_error).__name__}: {last_error}"
-                    yield out
-                    yielded += 1
-                    if max_samples is not None and yielded >= max_samples:
-                        return
-                    continue
+                    for sample in data_stream:
+                        if sample_get(sample, "is_first"):
+                            local_episode_idx += 1
+                        if local_episode_idx < 0 or local_episode_idx >= len(episode_rows):
+                            raise IndexError(
+                                f"DROID episode pointer {local_episode_idx} is out of bounds for {meta_file}"
+                            )
 
-                out = dict(sample)
-                out["observation.images.active_camera"] = used_camera
-                out["episode_instruction"] = episode_instruction
-                out["decoded_image"] = image
-                yield out
-                yielded += 1
+                        episode_row = episode_rows[local_episode_idx]
+                        episode_instruction = _extract_episode_instruction(episode_row.get("tasks"))
+                        if skip_unlabeled_episodes and episode_instruction is None:
+                            continue
+                        frame_index = int(sample_get(sample, "frame_index") or 0)
+                        sample_key = (data_file, local_episode_idx, frame_index)
+                        if sample_key in yielded_keys:
+                            continue
 
-                if max_samples is not None and yielded >= max_samples:
-                    return
+                        image = None
+                        last_error = None
+                        used_camera = None
+                        for camera_key in camera_keys:
+                            chunk_idx = episode_row.get(f"videos/{camera_key}/chunk_index")
+                            file_idx = episode_row.get(f"videos/{camera_key}/file_index")
+                            from_ts = episode_row.get(f"videos/{camera_key}/from_timestamp")
+                            if chunk_idx is None or file_idx is None or from_ts is None:
+                                continue
+
+                            absolute_frame = int(round(float(from_ts) * fps)) + frame_index
+                            video_file = video_path_template.format(
+                                video_key=camera_key,
+                                chunk_index=int(chunk_idx),
+                                file_index=int(file_idx),
+                            )
+                            try:
+                                local_video_path = _retry_hf_call(
+                                    lambda vf=video_file: hf_hub_download(
+                                        repo_id=repo_id,
+                                        repo_type="dataset",
+                                        filename=vf,
+                                    )
+                                )
+                                image = reader.read_frame(local_video_path, absolute_frame)
+                                used_camera = camera_key
+                                break
+                            except Exception as exc:
+                                last_error = exc
+
+                        out = dict(sample)
+                        out["observation.images.active_camera"] = used_camera
+                        out["episode_instruction"] = episode_instruction
+                        out["decoded_image"] = image
+                        if image is None and last_error is not None:
+                            out["decode_error"] = f"{type(last_error).__name__}: {last_error}"
+
+                        yielded_keys.add(sample_key)
+                        yield out
+                        yielded += 1
+
+                        if max_samples is not None and yielded >= max_samples:
+                            return
+                    break
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    if stream_attempt >= HF_RETRY_ATTEMPTS:
+                        raise
+                    time.sleep(HF_RETRY_BACKOFF_S * (2 ** (stream_attempt - 1)))
     finally:
         reader.close()

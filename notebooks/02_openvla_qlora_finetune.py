@@ -50,6 +50,23 @@ def verify_torch_numpy_bridge():
     print(f"✅ Verified torch↔numpy bridge ({output})")
 
 
+def verify_runtime_versions():
+    import importlib.metadata as importlib_metadata
+
+    expected_versions = {
+        "torch": "2.2.0",
+        "torchvision": "0.17.0",
+        "transformers": "4.40.1",
+        "tokenizers": "0.19.1",
+        "accelerate": "0.30.1",
+        "peft": "0.11.1",
+    }
+    for pkg, expected in expected_versions.items():
+        actual = importlib_metadata.version(pkg)
+        if actual != expected:
+            raise RuntimeError(f"Expected {pkg}=={expected}, found {actual}")
+
+
 def install():
     pkgs = [
         # Official OpenVLA-compatible stack
@@ -71,6 +88,7 @@ def install():
     ]
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--upgrade"] + pkgs)
     verify_torch_numpy_bridge()
+    verify_runtime_versions()
     print("✅ Official OpenVLA dependencies installed")
 
 install()
@@ -132,6 +150,7 @@ DROID_MAX_SAMPLES = 500                         # lower the real-data mix for lo
 DROID_FPS = DROID_DEFAULT_FPS                   # keep one shared control-rate assumption
 DROID_FRAME_STRIDE = DROID_FRAME_STRIDE_DEFAULT
 DROID_MAX_FRAMES_PER_EPISODE = DROID_MAX_FRAMES_PER_EPISODE_DEFAULT
+DROID_KEEP_IDLE_OPEN_PROB = 0.35
 OUTPUT_DIR = "/kaggle/working/openvla-finetuned"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -290,7 +309,7 @@ def format_vla_prompt(instruction):
     )
 
 
-def build_supervised_batch(processor, images, prompts, actions, device, max_length):
+def build_supervised_batch(processor, images, prompts, actions, device, model_dtype, max_length):
     """
     Build causal-LM supervision with prompt tokens masked out.
 
@@ -323,9 +342,14 @@ def build_supervised_batch(processor, images, prompts, actions, device, max_leng
     for i, prompt_len in enumerate(prompt_lengths.tolist()):
         labels[i, :prompt_len] = -100
 
-    full_inputs = full_inputs.to(device)
-    full_inputs["labels"] = labels.to(device)
-    return full_inputs, target_texts
+    prepared_inputs = {}
+    for key, value in full_inputs.items():
+        if torch.is_floating_point(value):
+            prepared_inputs[key] = value.to(device=device, dtype=model_dtype)
+        else:
+            prepared_inputs[key] = value.to(device)
+    prepared_inputs["labels"] = labels.to(device)
+    return prepared_inputs, target_texts
 
 
 def save_franka_action_metadata(save_dir):
@@ -414,6 +438,7 @@ class VLADemoDataset(Dataset):
         self.source_counts = {}
         self.use_mujoco_demos = use_mujoco_demos
         self.demo_dir = resolve_demo_dir(demo_dir) if use_mujoco_demos else None
+        self.rng = np.random.default_rng(7)
 
         # Load all self-collected demos (MuJoCo)
         self.samples = []
@@ -555,6 +580,18 @@ class VLADemoDataset(Dataset):
                             candidate_skip_stats["bad_image"] += 1
                             continue
 
+                        if (
+                            bucket_franka_action(
+                                action_7d,
+                                min_translation_cm=ACTIVE_TRANSLATION_CM,
+                                min_rotation_deg=ACTIVE_ROTATION_DEG,
+                            ) == "open_idle"
+                            and self.rng.random() > DROID_KEEP_IDLE_OPEN_PROB
+                        ):
+                            candidate_skip_stats["idle_open_downsample"] = (
+                                candidate_skip_stats.get("idle_open_downsample", 0) + 1
+                            )
+                            continue
                         self.samples.append({
                             "image": image_arr,
                             "instruction": str(instruction),
@@ -853,6 +890,7 @@ for epoch in range(NUM_EPOCHS):
             prompts,
             actions,
             model.device,
+            next(model.parameters()).dtype,
             MAX_SEQ_LEN,
         )
 
