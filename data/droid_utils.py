@@ -66,6 +66,7 @@ __all__ = [
     "sample_get",
     "bucket_franka_action",
     "franka_action_motion_metrics",
+    "franka_action_rebalance_weight",
     "is_control_relevant_action",
     "select_droid_frame",
     "select_droid_gripper_command",
@@ -176,6 +177,37 @@ def bucket_franka_action(
     gripper_name = "close" if metrics["gripper_close"] else "open"
     motion_name = "active" if active else "idle"
     return f"{gripper_name}_{motion_name}"
+
+
+def franka_action_rebalance_weight(
+    action,
+    *,
+    min_translation_cm=DROID_ACTIVE_TRANSLATION_CM_DEFAULT,
+    min_rotation_deg=DROID_ACTIVE_ROTATION_DEG_DEFAULT,
+    active_bonus=2.0,
+    close_bonus=1.75,
+    motion_scale=0.35,
+    motion_cap=4.0,
+):
+    """
+    Return a motion-aware sampling weight for Franka delta-pose actions.
+
+    The public DROID subset remains skewed toward easier open-gripper or near-static
+    frames even after episode/frame subsampling. We counter that by increasing the
+    weight of close commands and larger-magnitude motions instead of only rebalancing
+    coarse open/close × idle/active buckets.
+    """
+    metrics = franka_action_motion_metrics(action)
+    translation_ratio = metrics["translation_cm"] / max(float(min_translation_cm), 1e-6)
+    rotation_ratio = metrics["rotation_deg"] / max(float(min_rotation_deg), 1e-6)
+    motion_ratio = min(max(translation_ratio, rotation_ratio), motion_cap)
+
+    weight = 1.0 + motion_scale * motion_ratio
+    if motion_ratio >= 1.0:
+        weight *= active_bonus
+    if metrics["gripper_close"]:
+        weight *= close_bonus
+    return float(weight)
 
 
 def select_droid_gripper_command(

@@ -33,7 +33,8 @@ def test_openvla_notebook_loads_real_data_from_droid():
     assert '"cadene/droid_1.0.1_v30"' in source
     assert "DROID_MAX_SAMPLES = 500" in source
     assert "DROID_FPS = DROID_DEFAULT_FPS" in source
-    assert "DROID_KEEP_IDLE_OPEN_PROB = 0.35" in source
+    assert "DROID_KEEP_IDLE_OPEN_PROB = 0.15" in source
+    assert "DROID_KEEP_IDLE_CLOSE_PROB = 0.70" in source
     assert "NUM_EPOCHS = 1" in source
     assert '"av>=12.0.0"' in source
     assert '"opencv-python-headless>=4.9.0"' in source
@@ -93,10 +94,13 @@ def test_openvla_notebook_supervises_structured_franka_delta_pose_targets():
     assert "def format_franka_action(action):" in source
     assert "def parse_franka_action(text):" in source
     assert 'ACTION_BIN_SIZE = 0.05' in source
-    assert '"action_encoding": "compact_integer_bins_v1"' in source
-    assert '"+06 -03 +00 +02 -11 +00 o"' in source
+    assert '"action_encoding": "axis_scoped_integer_bins_v2"' in source
+    assert '"target_format": "dxp06 dyn03 dzz00 axp02 ayn11 azz00 go"' in source
+    assert "def decode_franka_axis_token(token):" in source
+    assert "FRANKA_AXIS_TOKEN_PREFIXES = (\"dx\", \"dy\", \"dz\", \"ax\", \"ay\", \"az\")" in source
     assert "WeightedRandomSampler" in source
     assert "def build_training_sampler(samples):" in source
+    assert "franka_action_rebalance_weight(" in source
     assert "model_dtype" in source
     assert "dtype=model_dtype" in source
     assert 'outputs = model(**inputs)' in source

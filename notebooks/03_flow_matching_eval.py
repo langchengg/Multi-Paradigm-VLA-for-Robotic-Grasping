@@ -139,6 +139,7 @@ from data.droid_utils import (
     droid_cartesian_velocity_to_franka_action,
     ensure_franka_action_7d,
     franka_action_motion_metrics,
+    franka_action_rebalance_weight,
     image_to_uint8_array,
     is_control_relevant_action,
     iter_droid_v30_stream,
@@ -182,16 +183,20 @@ BATCH_SIZE = 16
 LEARNING_RATE = 3e-4
 IMAGE_SIZE = 224
 ACTION_DIM = 7
+MOTION_ACTION_DIM = 6
 ACTION_HORIZON = 1
 MAX_SEQ_LEN = 256
 MAX_EVAL_SAMPLES = 200
 QUALITATIVE_EXAMPLES = 6
 GRIPPER_LOSS_WEIGHT = 3.0
-OPENVLA_MAX_NEW_TOKENS = 24
+GRIPPER_FOCAL_GAMMA = 2.0
+GRIPPER_CALIBRATION_FRACTION = 0.15
+OPENVLA_MAX_NEW_TOKENS = 32
 ACTION_BIN_SIZE = 0.05
 ACTION_BIN_LIMIT = int(round(ACTION_MAX / ACTION_BIN_SIZE))
 ACTIVE_TRANSLATION_CM = DROID_ACTIVE_TRANSLATION_CM_DEFAULT
 ACTIVE_ROTATION_DEG = DROID_ACTIVE_ROTATION_DEG_DEFAULT
+FRANKA_AXIS_TOKEN_PREFIXES = ("dx", "dy", "dz", "ax", "ay", "az")
 
 OPENVLA_BASE_MODEL = "openvla/openvla-7b"
 HF_TOKEN = (
@@ -268,24 +273,24 @@ def snapshot_download_with_retry(repo_id, local_dir):
 
 def format_vla_prompt(instruction):
     return (
-        f"In: What normalized Franka Panda delta-pose action should the robot take to {instruction}?\n"
-        f"Out: Return 7 compact tokens in order dx dy dz dax day daz grip. "
-        f"Use signed integer bins in [-{ACTION_BIN_LIMIT}, {ACTION_BIN_LIMIT}] where 1 bin = {ACTION_BIN_SIZE:.2f} normalized units. "
-        "Use 'c' for gripper=close and 'o' for gripper=open.\n"
-        f"Controller scale: xyz bins map to {TRANSLATION_STEP_M:.3f} m/step and rpy bins map to {ROTATION_STEP_RAD:.2f} rad/step.\n"
+        f"Task: {instruction}\n"
+        "Return 7 action tokens in order dx dy dz ax ay az grip. "
+        f"Use dimension-scoped bins like dxp06 dyn03 dzz00 axp02 ayn11 azz00. "
+        f"Each bin is {ACTION_BIN_SIZE:.2f} normalized units in [-{ACTION_BIN_LIMIT}, {ACTION_BIN_LIMIT}]. "
+        "Use gc for gripper=close and go for gripper=open.\n"
         "Action:"
     )
 
 
 FRANKA_ACTION_PATTERN = re.compile(
     r"(?<!\S)"
-    r"(?P<dx>[+-]\d{2})\s+"
-    r"(?P<dy>[+-]\d{2})\s+"
-    r"(?P<dz>[+-]\d{2})\s+"
-    r"(?P<dax>[+-]\d{2})\s+"
-    r"(?P<day>[+-]\d{2})\s+"
-    r"(?P<daz>[+-]\d{2})\s+"
-    r"(?P<gripper>[oc])\b",
+    r"(?P<dx>dx[pnz]\d{2})\s+"
+    r"(?P<dy>dy[pnz]\d{2})\s+"
+    r"(?P<dz>dz[pnz]\d{2})\s+"
+    r"(?P<dax>ax[pnz]\d{2})\s+"
+    r"(?P<day>ay[pnz]\d{2})\s+"
+    r"(?P<daz>az[pnz]\d{2})\s+"
+    r"(?P<gripper>g[oc])\b",
     re.IGNORECASE,
 )
 FRANKA_LEGACY_ACTION_PATTERN = re.compile(
@@ -303,11 +308,26 @@ FRANKA_KEY_VALUE_PATTERN = re.compile(
 FRANKA_GRIPPER_PATTERN = re.compile(r"\bgripper\s*=\s*(open|close)\b", re.IGNORECASE)
 
 
+def decode_franka_axis_token(token):
+    token = token.strip().lower()
+    if len(token) != 5:
+        raise ValueError(f"Expected a 5-character axis token, found {token!r}")
+    sign = token[2]
+    magnitude = int(token[3:])
+    if sign == "p":
+        return magnitude * ACTION_BIN_SIZE
+    if sign == "n":
+        return -magnitude * ACTION_BIN_SIZE
+    if sign == "z":
+        return 0.0
+    raise ValueError(f"Unsupported sign code in token {token!r}")
+
+
 def parse_franka_action(text):
     match = FRANKA_ACTION_PATTERN.search(text)
     if match is not None:
-        values = [int(match.group(key)) * ACTION_BIN_SIZE for key in FRANKA_ACTION_KEYS[:-1]]
-        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper").lower() == "c" else GRIPPER_OPEN_VALUE)
+        values = [decode_franka_axis_token(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
+        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper").lower() == "gc" else GRIPPER_OPEN_VALUE)
         return ensure_franka_action_7d(values)
 
     match = FRANKA_LEGACY_ACTION_PATTERN.search(text)
@@ -530,6 +550,35 @@ def split_records_by_episode(records, eval_fraction):
     return train_records, eval_records
 
 
+def split_train_records_for_calibration(records, calibration_fraction):
+    """Hold out a small episode-level calibration split for gripper threshold tuning."""
+    episode_ids = []
+    seen = set()
+    for record in records:
+        episode_index = record["episode_index"]
+        if episode_index not in seen:
+            seen.add(episode_index)
+            episode_ids.append(episode_index)
+
+    if len(episode_ids) < 3 or calibration_fraction <= 0.0:
+        return records, []
+
+    calibration_episodes = max(1, int(round(len(episode_ids) * calibration_fraction)))
+    calibration_episodes = min(calibration_episodes, len(episode_ids) - 1)
+    calibration_episode_ids = set(episode_ids[-calibration_episodes:])
+
+    fit_records = [r for r in records if r["episode_index"] not in calibration_episode_ids]
+    calibration_records = [r for r in records if r["episode_index"] in calibration_episode_ids]
+    if not fit_records or not calibration_records:
+        return records, []
+    print(
+        "✅ DROID calibration split ready: "
+        f"{len(fit_records)} train frames, {len(calibration_records)} calibration frames, "
+        f"{len(episode_ids) - calibration_episodes} fit episodes, {calibration_episodes} calibration episodes"
+    )
+    return fit_records, calibration_records
+
+
 def compute_action_stats(records):
     actions = np.stack([record["action_7d"] for record in records], axis=0)
     return actions.mean(axis=0), actions.std(axis=0).clip(min=1e-6)
@@ -575,10 +624,11 @@ def build_record_sampler(records):
             min_rotation_deg=ACTIVE_ROTATION_DEG,
         )
         weight = 1.0 / bucket_counts[bucket]
-        if bucket.endswith("active"):
-            weight *= 1.5
-        if bucket.startswith("close"):
-            weight *= 1.5
+        weight *= franka_action_rebalance_weight(
+            record["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
         weights.append(weight)
 
     weights = np.asarray(weights, dtype=np.float64)
@@ -692,12 +742,17 @@ def collate_fn(batch):
 
 ACTIVE_DROID_REPO, all_droid_records = load_real_droid_records(DROID_MAX_SAMPLES)
 train_records, eval_records = split_records_by_episode(all_droid_records, DROID_EVAL_FRACTION)
-train_action_mean, train_action_std = compute_action_stats(train_records)
-train_gripper_pos_weight, train_gripper_close_rate = compute_gripper_pos_weight(train_records)
-train_sampler, train_bucket_counts = build_record_sampler(train_records)
+fit_records, calibration_records = split_train_records_for_calibration(
+    train_records,
+    GRIPPER_CALIBRATION_FRACTION,
+)
+train_action_mean, train_action_std = compute_action_stats(fit_records)
+train_gripper_pos_weight, train_gripper_close_rate = compute_gripper_pos_weight(fit_records)
+train_sampler, train_bucket_counts = build_record_sampler(fit_records)
 eval_diagnostics = summarize_eval_distribution(eval_records[: min(len(eval_records), MAX_EVAL_SAMPLES)])
 
-train_dataset = RealRobotActionDataset(train_records, img_size=IMAGE_SIZE)
+train_dataset = RealRobotActionDataset(fit_records, img_size=IMAGE_SIZE)
+calibration_dataset = RealRobotActionDataset(calibration_records, img_size=IMAGE_SIZE) if calibration_records else None
 eval_dataset = RealRobotActionDataset(eval_records, img_size=IMAGE_SIZE)
 train_loader = DataLoader(
     train_dataset,
@@ -708,8 +763,25 @@ train_loader = DataLoader(
     num_workers=2,
     pin_memory=True,
 )
+calibration_loader = (
+    DataLoader(
+        calibration_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True,
+    )
+    if calibration_dataset is not None
+    else None
+)
 
-print(f"✅ Offline datasets ready: {len(train_dataset)} train samples, {len(eval_dataset)} eval samples")
+print(
+    "✅ Offline datasets ready: "
+    f"{len(train_dataset)} train samples, "
+    f"{len(calibration_dataset) if calibration_dataset is not None else 0} calibration samples, "
+    f"{len(eval_dataset)} eval samples"
+)
 print(f"   Using DROID repo: {ACTIVE_DROID_REPO}")
 print(
     f"   Train gripper close rate: {train_gripper_close_rate:.1%} "
@@ -731,12 +803,27 @@ print(f"   Eval action buckets: {eval_diagnostics['bucket_counts']}")
 # ═══════════════════════════════════════════════════════════════
 
 
+def compute_gripper_focal_bce_loss(logits, targets, pos_weight, gamma):
+    """Emphasize hard close/open decisions instead of easy majority-class frames."""
+    bce = F.binary_cross_entropy_with_logits(
+        logits,
+        targets,
+        pos_weight=pos_weight,
+        reduction="none",
+    )
+    probs = torch.sigmoid(logits)
+    pt = torch.where(targets > 0.5, probs, 1.0 - probs)
+    focal_weight = (1.0 - pt).pow(gamma)
+    return (focal_weight * bce).mean()
+
+
 class FlowMatchingVLA(nn.Module):
     """Lightweight VLA with a flow-matching decoder."""
 
-    def __init__(self, action_dim=7, horizon=1):
+    def __init__(self, action_dim=ACTION_DIM, motion_dim=MOTION_ACTION_DIM, horizon=1):
         super().__init__()
         self.action_dim = action_dim
+        self.motion_dim = motion_dim
         self.horizon = horizon
         self.vision = ViTModel.from_pretrained("google/vit-base-patch16-224")
         for param in self.vision.parameters():
@@ -764,7 +851,7 @@ class FlowMatchingVLA(nn.Module):
             d_model=fuse_dim, nhead=8, dim_feedforward=1024, dropout=0.1, batch_first=True)
         self.flow_head = FlowMatchingHead(
             feature_dim=fuse_dim,
-            action_dim=action_dim,
+            action_dim=motion_dim,
             action_horizon=horizon,
             hidden_dim=512,
             num_layers=4,
@@ -776,6 +863,7 @@ class FlowMatchingVLA(nn.Module):
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
         self.register_buffer("gripper_pos_weight", torch.tensor(1.0))
+        self.register_buffer("gripper_threshold", torch.tensor(0.0))
 
     def encode(self, images, instructions):
         vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
@@ -797,13 +885,15 @@ class FlowMatchingVLA(nn.Module):
 
     def forward(self, images, instructions, actions_gt):
         features = self.encode(images, instructions)
-        action_loss, info = self.flow_head(features, actions_gt)
+        motion_targets = actions_gt[:, :, : self.motion_dim]
+        action_loss, info = self.flow_head(features, motion_targets)
         gripper_logits = self.gripper_head(features).squeeze(-1)
         gripper_targets = (actions_gt[:, 0, 6] > 0).float()
-        gripper_loss = F.binary_cross_entropy_with_logits(
+        gripper_loss = compute_gripper_focal_bce_loss(
             gripper_logits,
             gripper_targets,
             pos_weight=self.gripper_pos_weight,
+            gamma=GRIPPER_FOCAL_GAMMA,
         )
         total_loss = action_loss + GRIPPER_LOSS_WEIGHT * gripper_loss
         info["gripper_loss"] = float(gripper_loss.item())
@@ -811,7 +901,7 @@ class FlowMatchingVLA(nn.Module):
         return total_loss, info
 
     def set_action_stats(self, mean, std):
-        self.flow_head.set_action_stats(mean, std)
+        self.flow_head.set_action_stats(mean[: self.motion_dim], std[: self.motion_dim])
 
     def set_gripper_pos_weight(self, pos_weight):
         self.gripper_pos_weight.copy_(
@@ -822,16 +912,38 @@ class FlowMatchingVLA(nn.Module):
             )
         )
 
+    def set_gripper_threshold(self, threshold):
+        self.gripper_threshold.copy_(
+            torch.tensor(
+                float(threshold),
+                dtype=torch.float32,
+                device=self.gripper_threshold.device,
+            )
+        )
+
+    @torch.no_grad()
+    def predict_gripper_logits(self, images, instructions):
+        features = self.encode(images, instructions)
+        return self.gripper_head(features).squeeze(-1)
+
     @torch.no_grad()
     def predict(self, images, instructions, steps=10):
         features = self.encode(images, instructions)
-        actions = self.flow_head.sample(features, num_steps=steps)
+        motion_actions = self.flow_head.sample(features, num_steps=steps)
         gripper_logits = self.gripper_head(features).squeeze(-1)
         gripper_values = torch.where(
-            gripper_logits >= 0,
+            gripper_logits >= self.gripper_threshold,
             torch.full_like(gripper_logits, GRIPPER_CLOSE_VALUE),
             torch.full_like(gripper_logits, GRIPPER_OPEN_VALUE),
         )
+        actions = torch.zeros(
+            motion_actions.shape[0],
+            self.horizon,
+            self.action_dim,
+            device=motion_actions.device,
+            dtype=motion_actions.dtype,
+        )
+        actions[:, :, : self.motion_dim] = motion_actions
         actions[:, :, 6] = gripper_values.unsqueeze(-1)
         return actions
 
@@ -839,8 +951,11 @@ class FlowMatchingVLA(nn.Module):
 class DiffusionVLA(nn.Module):
     """Lightweight VLA with a diffusion action decoder."""
 
-    def __init__(self, action_dim=7, horizon=1):
+    def __init__(self, action_dim=ACTION_DIM, motion_dim=MOTION_ACTION_DIM, horizon=1):
         super().__init__()
+        self.action_dim = action_dim
+        self.motion_dim = motion_dim
+        self.horizon = horizon
         self.vision = ViTModel.from_pretrained("google/vit-base-patch16-224")
         for param in self.vision.parameters():
             param.requires_grad = False
@@ -867,7 +982,7 @@ class DiffusionVLA(nn.Module):
             d_model=fuse_dim, nhead=8, dim_feedforward=1024, dropout=0.1, batch_first=True)
         self.diffusion_head = DiffusionHead(
             feature_dim=fuse_dim,
-            action_dim=action_dim,
+            action_dim=motion_dim,
             action_horizon=horizon,
             hidden_dim=512,
             num_layers=4,
@@ -880,6 +995,7 @@ class DiffusionVLA(nn.Module):
             transforms.Normalize([0.5] * 3, [0.5] * 3),
         ])
         self.register_buffer("gripper_pos_weight", torch.tensor(1.0))
+        self.register_buffer("gripper_threshold", torch.tensor(0.0))
 
     def encode(self, images, instructions):
         vis_out = self.vision(pixel_values=images).last_hidden_state[:, 0]
@@ -900,7 +1016,7 @@ class DiffusionVLA(nn.Module):
         return fused
 
     def set_action_stats(self, mean, std):
-        self.diffusion_head.set_action_stats(mean, std)
+        self.diffusion_head.set_action_stats(mean[: self.motion_dim], std[: self.motion_dim])
 
     def set_gripper_pos_weight(self, pos_weight):
         self.gripper_pos_weight.copy_(
@@ -911,15 +1027,26 @@ class DiffusionVLA(nn.Module):
             )
         )
 
+    def set_gripper_threshold(self, threshold):
+        self.gripper_threshold.copy_(
+            torch.tensor(
+                float(threshold),
+                dtype=torch.float32,
+                device=self.gripper_threshold.device,
+            )
+        )
+
     def forward(self, images, instructions, actions_gt):
         features = self.encode(images, instructions)
-        action_loss, info = self.diffusion_head(features, actions_gt)
+        motion_targets = actions_gt[:, :, : self.motion_dim]
+        action_loss, info = self.diffusion_head(features, motion_targets)
         gripper_logits = self.gripper_head(features).squeeze(-1)
         gripper_targets = (actions_gt[:, 0, 6] > 0).float()
-        gripper_loss = F.binary_cross_entropy_with_logits(
+        gripper_loss = compute_gripper_focal_bce_loss(
             gripper_logits,
             gripper_targets,
             pos_weight=self.gripper_pos_weight,
+            gamma=GRIPPER_FOCAL_GAMMA,
         )
         total_loss = action_loss + GRIPPER_LOSS_WEIGHT * gripper_loss
         info["gripper_loss"] = float(gripper_loss.item())
@@ -927,15 +1054,28 @@ class DiffusionVLA(nn.Module):
         return total_loss, info
 
     @torch.no_grad()
+    def predict_gripper_logits(self, images, instructions):
+        features = self.encode(images, instructions)
+        return self.gripper_head(features).squeeze(-1)
+
+    @torch.no_grad()
     def predict(self, images, instructions, steps=10):
         features = self.encode(images, instructions)
-        actions = self.diffusion_head.sample(features, num_steps=steps)
+        motion_actions = self.diffusion_head.sample(features, num_steps=steps)
         gripper_logits = self.gripper_head(features).squeeze(-1)
         gripper_values = torch.where(
-            gripper_logits >= 0,
+            gripper_logits >= self.gripper_threshold,
             torch.full_like(gripper_logits, GRIPPER_CLOSE_VALUE),
             torch.full_like(gripper_logits, GRIPPER_OPEN_VALUE),
         )
+        actions = torch.zeros(
+            motion_actions.shape[0],
+            self.horizon,
+            self.action_dim,
+            device=motion_actions.device,
+            dtype=motion_actions.dtype,
+        )
+        actions[:, :, : self.motion_dim] = motion_actions
         actions[:, :, 6] = gripper_values.unsqueeze(-1)
         return actions
 
@@ -955,15 +1095,80 @@ def set_model_gripper_stats(model, pos_weight):
         model.set_gripper_pos_weight(pos_weight)
 
 
+def set_model_gripper_threshold(model, threshold):
+    if hasattr(model, "set_gripper_threshold"):
+        model.set_gripper_threshold(threshold)
+
+
 def count_parameters(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return total, trainable
 
 
+@torch.no_grad()
+def calibrate_gripper_threshold(model, loader, run_name):
+    """Choose a gripper threshold that maximizes balanced accuracy on calibration data."""
+    if loader is None or len(loader.dataset) == 0:
+        set_model_gripper_threshold(model, 0.0)
+        return 0.0, None
+
+    model.eval()
+    logits_all = []
+    targets_all = []
+    for imgs, instrs, acts in loader:
+        imgs = imgs.to(DEVICE)
+        logits = model.predict_gripper_logits(imgs, instrs)
+        logits_all.append(logits.detach().cpu())
+        targets_all.append((acts[:, 0, 6] > 0).float())
+
+    logits = torch.cat(logits_all).numpy()
+    targets = torch.cat(targets_all).numpy().astype(bool)
+    if logits.size == 0:
+        set_model_gripper_threshold(model, 0.0)
+        return 0.0, None
+
+    candidate_thresholds = np.unique(
+        np.concatenate([
+            np.array([-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0], dtype=np.float32),
+            np.quantile(logits, np.linspace(0.05, 0.95, 19)).astype(np.float32),
+        ])
+    )
+    best = None
+    for threshold in candidate_thresholds.tolist():
+        pred_close = logits >= threshold
+        tp = float(np.sum(pred_close & targets))
+        tn = float(np.sum((~pred_close) & (~targets)))
+        fp = float(np.sum(pred_close & (~targets)))
+        fn = float(np.sum((~pred_close) & targets))
+        tpr = tp / max(tp + fn, 1.0)
+        tnr = tn / max(tn + fp, 1.0)
+        balanced_acc = 0.5 * (tpr + tnr)
+        accuracy = float(np.mean(pred_close == targets))
+        score = (balanced_acc, tpr, accuracy, -abs(threshold))
+        if best is None or score > best["score"]:
+            best = {
+                "threshold": float(threshold),
+                "balanced_accuracy": float(balanced_acc),
+                "accuracy": float(accuracy),
+                "tpr": float(tpr),
+                "tnr": float(tnr),
+                "score": score,
+            }
+
+    set_model_gripper_threshold(model, best["threshold"])
+    print(
+        f"✅ {run_name} gripper threshold calibrated on {len(targets)} frames: "
+        f"threshold={best['threshold']:+.3f} | bal_acc={best['balanced_accuracy']:.1%} | "
+        f"TPR={best['tpr']:.1%} | TNR={best['tnr']:.1%}"
+    )
+    return best["threshold"], best
+
+
 def train_vla_model(
     model,
     loader,
+    calibration_loader,
     num_epochs,
     run_name,
     checkpoint_name,
@@ -1028,6 +1233,10 @@ def train_vla_model(
         "run_name": run_name,
         "data_repo": ACTIVE_DROID_REPO,
     }
+    threshold, threshold_info = calibrate_gripper_threshold(model, calibration_loader, run_name)
+    checkpoint["gripper_threshold"] = threshold
+    if threshold_info is not None:
+        checkpoint["gripper_threshold_info"] = threshold_info
     torch.save(checkpoint, os.path.join(OUTPUT_DIR, checkpoint_name))
 
     plt.figure(figsize=(10, 5))
@@ -1054,6 +1263,7 @@ flow_model = FlowMatchingVLA(action_dim=ACTION_DIM, horizon=ACTION_HORIZON).to(D
 flow_model, flow_train_losses = train_vla_model(
     flow_model,
     train_loader,
+    calibration_loader,
     FLOW_TRAIN_EPOCHS,
     run_name="flow_matching",
     checkpoint_name="flow_matching_vla.pt",
@@ -1067,6 +1277,7 @@ diffusion_model = DiffusionVLA(action_dim=ACTION_DIM, horizon=ACTION_HORIZON).to
 diffusion_model, diffusion_train_losses = train_vla_model(
     diffusion_model,
     train_loader,
+    calibration_loader,
     DIFFUSION_TRAIN_EPOCHS,
     run_name="diffusion",
     checkpoint_name="diffusion_vla.pt",

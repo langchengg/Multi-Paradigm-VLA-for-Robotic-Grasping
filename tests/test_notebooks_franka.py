@@ -51,15 +51,21 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "load_droid_info," in source
     assert "from models.flow_matching_head import FlowMatchingHead" in source
     assert "self.action_dim = action_dim" in source
+    assert "self.motion_dim = motion_dim" in source
     assert "self.horizon = horizon" in source
     assert "action_horizon=horizon" in source
     assert "self.gripper_head = nn.Linear(fuse_dim, 1)" in source
     assert "GRIPPER_LOSS_WEIGHT = 3.0" in source
+    assert "GRIPPER_FOCAL_GAMMA = 2.0" in source
     assert "set_gripper_pos_weight" in source
-    assert "gripper_loss = F.binary_cross_entropy_with_logits(" in source
-    assert "actions = self.flow_head.sample(features, num_steps=steps)" in source
+    assert "def compute_gripper_focal_bce_loss(logits, targets, pos_weight, gamma):" in source
+    assert "motion_targets = actions_gt[:, :, : self.motion_dim]" in source
+    assert "actions[:, :, : self.motion_dim] = motion_actions" in source
+    assert "def calibrate_gripper_threshold(model, loader, run_name):" in source
+    assert "gripper_logits >= self.gripper_threshold" in source
     assert "def load_real_droid_records(max_samples):" in source
     assert "def build_record_sampler(records):" in source
+    assert "franka_action_rebalance_weight(" in source
     assert "WeightedRandomSampler" in source
     assert "def summarize_eval_distribution(records):" in source
     assert 'comparison_summary["_diagnostics"] = eval_diagnostics' in source
@@ -72,9 +78,11 @@ def test_notebook3_uses_droid_real_data_for_offline_eval():
     assert "max_raw_droid_frames = max(max_samples * 8, 2000)" in source
     assert "select_droid_frame(" in source
     assert "def split_records_by_episode(records, eval_fraction):" in source
+    assert "def split_train_records_for_calibration(records, calibration_fraction):" in source
     assert "DROID skip stats:" in source
     assert "class OfflineRealDataEvaluator:" in source
     assert 'train_records, eval_records = split_records_by_episode(all_droid_records, DROID_EVAL_FRACTION)' in source
+    assert "fit_records, calibration_records = split_train_records_for_calibration(" in source
     assert "class DiffusionVLA(nn.Module):" in source
     assert "class OpenVLAPolicyWrapper:" in source
     assert "self.input_dtype = torch.float32" in source

@@ -124,6 +124,7 @@ from data.droid_utils import (
     droid_action_to_franka_action,
     droid_cartesian_velocity_to_franka_action,
     ensure_franka_action_7d,
+    franka_action_rebalance_weight,
     franka_action_motion_metrics,
     image_to_uint8_array,
     is_control_relevant_action,
@@ -151,7 +152,8 @@ DROID_MAX_SAMPLES = 500                         # lower the real-data mix for lo
 DROID_FPS = DROID_DEFAULT_FPS                   # keep one shared control-rate assumption
 DROID_FRAME_STRIDE = DROID_FRAME_STRIDE_DEFAULT
 DROID_MAX_FRAMES_PER_EPISODE = DROID_MAX_FRAMES_PER_EPISODE_DEFAULT
-DROID_KEEP_IDLE_OPEN_PROB = 0.35
+DROID_KEEP_IDLE_OPEN_PROB = 0.15
+DROID_KEEP_IDLE_CLOSE_PROB = 0.70
 OUTPUT_DIR = "/kaggle/working/openvla-finetuned"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 HF_TOKEN = (
@@ -175,11 +177,12 @@ IMAGE_SIZE = 224                  # OpenVLA input resolution
 MAX_SEQ_LEN = 256
 SAVE_STEPS = 200
 LOG_STEPS = 10
-OPENVLA_MAX_NEW_TOKENS = 24
+OPENVLA_MAX_NEW_TOKENS = 32
 ACTION_BIN_SIZE = 0.05
 ACTION_BIN_LIMIT = int(round(ACTION_MAX / ACTION_BIN_SIZE))
 ACTIVE_TRANSLATION_CM = DROID_ACTIVE_TRANSLATION_CM_DEFAULT
 ACTIVE_ROTATION_DEG = DROID_ACTIVE_ROTATION_DEG_DEFAULT
+FRANKA_AXIS_TOKEN_PREFIXES = ("dx", "dy", "dz", "ax", "ay", "az")
 
 print(f"✅ Config ready")
 print(f"   Model: {MODEL_NAME}")
@@ -219,29 +222,33 @@ def franka_action_to_physical_delta(action):
 
 def format_franka_action(action):
     """
-    Serialize a normalized Franka delta-pose action as compact discrete bins.
+    Serialize a normalized Franka delta-pose action as dimension-scoped discrete tokens.
 
-    OpenVLA is a text generator, so forcing it to emit long floating-point strings makes
-    one-step control both slow and brittle. Short integer bins are easier to learn, faster
-    to decode, and still precise enough for this repo's 3 cm / 0.05 rad control scale.
+    The earlier compact integer-only format (`+06 -03 ...`) kept parsing simple, but it
+    also made all motion dimensions share the same token surface form. In practice the
+    model tended to collapse the first 6 dimensions toward repeated zero-ish tokens.
+    Prefixing each bin with its axis name (for example `dxp06`, `ayn11`) makes non-zero
+    motion easier to express and less likely to collapse into a generic default action.
     """
     action = ensure_franka_action_7d(action)
     bins = np.clip(np.round(action[:6] / ACTION_BIN_SIZE), -ACTION_BIN_LIMIT, ACTION_BIN_LIMIT).astype(int)
-    gripper_cmd = "c" if action[6] > 0 else "o"
-    values = [f"{value:+03d}" for value in bins.tolist()]
-    values.append(gripper_cmd)
+    values = []
+    for prefix, value in zip(FRANKA_AXIS_TOKEN_PREFIXES, bins.tolist()):
+        sign = "p" if value > 0 else "n" if value < 0 else "z"
+        values.append(f"{prefix}{sign}{abs(value):02d}")
+    values.append("gc" if action[6] > 0 else "go")
     return " ".join(values)
 
 
 FRANKA_ACTION_PATTERN = re.compile(
     r"(?<!\S)"
-    r"(?P<dx>[+-]\d{2})\s+"
-    r"(?P<dy>[+-]\d{2})\s+"
-    r"(?P<dz>[+-]\d{2})\s+"
-    r"(?P<dax>[+-]\d{2})\s+"
-    r"(?P<day>[+-]\d{2})\s+"
-    r"(?P<daz>[+-]\d{2})\s+"
-    r"(?P<gripper>[oc])\b",
+    r"(?P<dx>dx[pnz]\d{2})\s+"
+    r"(?P<dy>dy[pnz]\d{2})\s+"
+    r"(?P<dz>dz[pnz]\d{2})\s+"
+    r"(?P<dax>ax[pnz]\d{2})\s+"
+    r"(?P<day>ay[pnz]\d{2})\s+"
+    r"(?P<daz>az[pnz]\d{2})\s+"
+    r"(?P<gripper>g[oc])\b",
     re.IGNORECASE,
 )
 FRANKA_LEGACY_ACTION_PATTERN = re.compile(
@@ -263,12 +270,27 @@ FRANKA_VECTOR_PATTERN = re.compile(
 )
 
 
+def decode_franka_axis_token(token):
+    token = token.strip().lower()
+    if len(token) != 5:
+        raise ValueError(f"Expected a 5-character axis token, found {token!r}")
+    sign = token[2]
+    magnitude = int(token[3:])
+    if sign == "p":
+        return magnitude * ACTION_BIN_SIZE
+    if sign == "n":
+        return -magnitude * ACTION_BIN_SIZE
+    if sign == "z":
+        return 0.0
+    raise ValueError(f"Unsupported sign code in token {token!r}")
+
+
 def parse_franka_action(text):
     """Parse the generated textual action back into the env's normalized 7-DOF control."""
     match = FRANKA_ACTION_PATTERN.search(text)
     if match is not None:
-        values = [int(match.group(key)) * ACTION_BIN_SIZE for key in FRANKA_ACTION_KEYS[:-1]]
-        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper").lower() == "c" else GRIPPER_OPEN_VALUE)
+        values = [decode_franka_axis_token(match.group(key)) for key in FRANKA_ACTION_KEYS[:-1]]
+        values.append(GRIPPER_CLOSE_VALUE if match.group("gripper").lower() == "gc" else GRIPPER_OPEN_VALUE)
         return ensure_franka_action_7d(values)
 
     match = FRANKA_LEGACY_ACTION_PATTERN.search(text)
@@ -309,11 +331,11 @@ def format_physical_delta(action):
 def format_vla_prompt(instruction):
     """Describe the exact Franka end-effector control interface expected from the model."""
     return (
-        f"In: What normalized Franka Panda delta-pose action should the robot take to {instruction}?\n"
-        f"Out: Return 7 compact tokens in order dx dy dz dax day daz grip. "
-        f"Use signed integer bins in [-{ACTION_BIN_LIMIT}, {ACTION_BIN_LIMIT}] where 1 bin = {ACTION_BIN_SIZE:.2f} normalized units. "
-        "Use 'c' for gripper=close and 'o' for gripper=open.\n"
-        f"Controller scale: xyz bins map to {TRANSLATION_STEP_M:.3f} m/step and rpy bins map to {ROTATION_STEP_RAD:.2f} rad/step.\n"
+        f"Task: {instruction}\n"
+        "Return 7 action tokens in order dx dy dz ax ay az grip. "
+        f"Use dimension-scoped bins like dxp06 dyn03 dzz00 axp02 ayn11 azz00. "
+        f"Each bin is {ACTION_BIN_SIZE:.2f} normalized units in [-{ACTION_BIN_LIMIT}, {ACTION_BIN_LIMIT}]. "
+        "Use gc for gripper=close and go for gripper=open.\n"
         "Action:"
     )
 
@@ -370,15 +392,15 @@ def save_franka_action_metadata(save_dir):
         "normalized_range": [ACTION_MIN, ACTION_MAX],
         "translation_step_m": TRANSLATION_STEP_M,
         "rotation_step_rad": ROTATION_STEP_RAD,
-            "action_encoding": "compact_integer_bins_v1",
-            "action_bin_size": ACTION_BIN_SIZE,
-            "action_bin_limit": ACTION_BIN_LIMIT,
-            "gripper_semantics": {
-                "negative": "open",
-                "positive": "close",
-            },
-            "target_format": "+06 -03 +00 +02 -11 +00 o",
-        }
+        "action_encoding": "axis_scoped_integer_bins_v2",
+        "action_bin_size": ACTION_BIN_SIZE,
+        "action_bin_limit": ACTION_BIN_LIMIT,
+        "gripper_semantics": {
+            "negative": "open",
+            "positive": "close",
+        },
+        "target_format": "dxp06 dyn03 dzz00 axp02 ayn11 azz00 go",
+    }
     with open(os.path.join(save_dir, "franka_action_config.json"), "w") as f:
         json.dump(metadata, f, indent=2)
 
@@ -624,16 +646,19 @@ class VLADemoDataset(Dataset):
                             candidate_skip_stats["bad_image"] += 1
                             continue
 
-                        if (
-                            bucket_franka_action(
-                                action_7d,
-                                min_translation_cm=ACTIVE_TRANSLATION_CM,
-                                min_rotation_deg=ACTIVE_ROTATION_DEG,
-                            ) == "open_idle"
-                            and self.rng.random() > DROID_KEEP_IDLE_OPEN_PROB
-                        ):
+                        bucket_name = bucket_franka_action(
+                            action_7d,
+                            min_translation_cm=ACTIVE_TRANSLATION_CM,
+                            min_rotation_deg=ACTIVE_ROTATION_DEG,
+                        )
+                        if bucket_name == "open_idle" and self.rng.random() > DROID_KEEP_IDLE_OPEN_PROB:
                             candidate_skip_stats["idle_open_downsample"] = (
                                 candidate_skip_stats.get("idle_open_downsample", 0) + 1
+                            )
+                            continue
+                        if bucket_name == "close_idle" and self.rng.random() > DROID_KEEP_IDLE_CLOSE_PROB:
+                            candidate_skip_stats["idle_close_downsample"] = (
+                                candidate_skip_stats.get("idle_close_downsample", 0) + 1
                             )
                             continue
                         self.samples.append({
@@ -751,10 +776,11 @@ def build_training_sampler(samples):
             min_rotation_deg=ACTIVE_ROTATION_DEG,
         )
         weight = 1.0 / bucket_counts[bucket]
-        if bucket.endswith("active"):
-            weight *= 1.5
-        if bucket.startswith("close"):
-            weight *= 1.5
+        weight *= franka_action_rebalance_weight(
+            sample["action_7d"],
+            min_translation_cm=ACTIVE_TRANSLATION_CM,
+            min_rotation_deg=ACTIVE_ROTATION_DEG,
+        )
         weights.append(weight)
 
     weights = np.asarray(weights, dtype=np.float64)
