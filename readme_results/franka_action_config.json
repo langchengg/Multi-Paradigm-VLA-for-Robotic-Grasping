@@ -1,0 +1,26 @@
+{
+  "control_mode": "franka_delta_pose",
+  "action_order": [
+    "dx",
+    "dy",
+    "dz",
+    "dax",
+    "day",
+    "daz",
+    "gripper"
+  ],
+  "normalized_range": [
+    -1.0,
+    1.0
+  ],
+  "translation_step_m": 0.03,
+  "rotation_step_rad": 0.05,
+  "action_encoding": "compact_integer_bins_v1",
+  "action_bin_size": 0.05,
+  "action_bin_limit": 20,
+  "gripper_semantics": {
+    "negative": "open",
+    "positive": "close"
+  },
+  "target_format": "+06 -03 +00 +02 -11 +00 o"
+}

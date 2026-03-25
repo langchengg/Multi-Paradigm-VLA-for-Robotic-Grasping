@@ -217,6 +217,38 @@ You will have these outputs under `/kaggle/working/`:
 15. `results/real_offline_examples.png`
 16. `results/technical_report.md`
 
+### Latest Offline DROID Pilot Result
+
+Latest held-out DROID run from the current codebase:
+
+- Source: `cadene/droid_1.0.1_v30`
+- Total streamed frames: `500`
+- Train frames: `443`
+- Eval frames: `57`
+- Eval open-majority baseline: `56.1%`
+- Eval zero-action baseline: `0.97 cm / 0.63 deg`
+- Control-relevant eval fraction: `84.2%`
+
+| Decoder | Translation MAE (cm) | Rotation MAE (deg) | Gripper Acc | Gripper Bal Acc | P50 Latency |
+|---|---:|---:|---:|---:|---:|
+| Autoregressive | 0.97 | 0.63 | 84.2% | 84.6% | 3500.2 ms |
+| Diffusion | 2.73 | 2.36 | 52.6% | 49.1% | 23.2 ms |
+| Flow-Matching | 1.56 | 1.00 | 50.9% | 47.1% | 22.6 ms |
+
+![Latest offline metrics](assets/readme_results/real_offline_metrics.png)
+
+![Latest qualitative examples](assets/readme_results/real_offline_examples.png)
+
+Interpretation:
+
+- Autoregressive OpenVLA currently learns the binary gripper decision much better than the lightweight baselines.
+- Flow-Matching remains the best non-autoregressive motion decoder in this run.
+- Diffusion is currently the weakest of the three on both translation and rotation error.
+- The autoregressive motion numbers should still be treated carefully: they are almost identical to the zero-action baseline, which suggests the first 6 motion dimensions may still be partially collapsed even though gripper prediction improved.
+- The autoregressive decoder is still far slower than the continuous decoders on T4, so this run does not support a blanket claim that it is the best overall method.
+
+This should be read as a pilot result from a small held-out subset, not as a final research conclusion.
+
 ---
 
 ## 🏗️ System Architecture

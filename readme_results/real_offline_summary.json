@@ -1,0 +1,71 @@
+{
+  "flow_matching": {
+    "translation_mae_cm": 1.5594347893146046,
+    "rotation_mae_deg": 0.9966509472251984,
+    "normalized_l1": 0.5122259138968953,
+    "gripper_accuracy": 0.5087719298245614,
+    "gripper_balanced_accuracy": 0.470625,
+    "gripper_tpr": 0.16,
+    "gripper_tnr": 0.78125,
+    "parse_fail_rate": 0.0,
+    "avg_inference_ms": 23.75718166953639,
+    "p50_inference_ms": 22.636890411376953,
+    "p95_inference_ms": 32.18274116516113,
+    "num_examples": 57,
+    "control_relevant_num_examples": 48,
+    "control_relevant_fraction": 0.8421052631578947,
+    "control_relevant_translation_mae_cm": 1.6567288140455882,
+    "control_relevant_rotation_mae_deg": 1.0229674918421854,
+    "control_relevant_gripper_accuracy": 0.4375
+  },
+  "diffusion": {
+    "translation_mae_cm": 2.729370801072372,
+    "rotation_mae_deg": 2.361974606911341,
+    "normalized_l1": 0.8785990487065232,
+    "gripper_accuracy": 0.5263157894736842,
+    "gripper_balanced_accuracy": 0.490625,
+    "gripper_tpr": 0.2,
+    "gripper_tnr": 0.78125,
+    "parse_fail_rate": 0.0,
+    "avg_inference_ms": 23.604208962959156,
+    "p50_inference_ms": 23.24962615966797,
+    "p95_inference_ms": 25.007915496826172,
+    "num_examples": 57,
+    "control_relevant_num_examples": 48,
+    "control_relevant_fraction": 0.8421052631578947,
+    "control_relevant_translation_mae_cm": 2.7440597067276635,
+    "control_relevant_rotation_mae_deg": 2.3952358874181905,
+    "control_relevant_gripper_accuracy": 0.4583333333333333
+  },
+  "autoregressive": {
+    "translation_mae_cm": 0.9701069531994954,
+    "rotation_mae_deg": 0.6268524919685564,
+    "normalized_l1": 0.27747640582291705,
+    "gripper_accuracy": 0.8421052631578947,
+    "gripper_balanced_accuracy": 0.84625,
+    "gripper_tpr": 0.88,
+    "gripper_tnr": 0.8125,
+    "parse_fail_rate": 0.017543859649122806,
+    "avg_inference_ms": 3512.9202206929526,
+    "p50_inference_ms": 3500.199794769287,
+    "p95_inference_ms": 3635.518264770508,
+    "num_examples": 57,
+    "control_relevant_num_examples": 48,
+    "control_relevant_fraction": 0.8421052631578947,
+    "control_relevant_translation_mae_cm": 1.146137523309638,
+    "control_relevant_rotation_mae_deg": 0.7372219736377398,
+    "control_relevant_gripper_accuracy": 0.8541666666666666
+  },
+  "_diagnostics": {
+    "open_majority_accuracy": 0.5614035087719298,
+    "zero_action_translation_mae_cm": 0.9701069593429565,
+    "zero_action_rotation_mae_deg": 0.6268524527549744,
+    "control_relevant_fraction": 0.8421052631578947,
+    "bucket_counts": {
+      "open_idle": 9,
+      "open_active": 23,
+      "close_active": 23,
+      "close_idle": 2
+    }
+  }
+}
