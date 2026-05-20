@@ -7,19 +7,6 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    class SummaryWriter:  # type: ignore[no-redef]
-        def __init__(self, *args, **kwargs):
-            print("[train] TensorBoard is unavailable; continuing without event logs.")
-
-        def add_scalar(self, *args, **kwargs):
-            return None
-
-        def close(self):
-            return None
-
 from src.data.common_dataset import VLADataset, collate_vla_batch
 from src.data.libero_adapter import LiberoVLADataset
 from src.models.policy import VLAPolicy
@@ -46,6 +33,23 @@ def build_dataset(args):
     if args.dataset == "libero":
         return LiberoVLADataset(args.data_path, horizon=args.horizon, suite=args.libero_suite)
     raise ValueError(f"Unknown dataset: {args.dataset}")
+
+
+class NullSummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        return None
+
+
+def make_summary_writer(args):
+    if args.disable_tensorboard:
+        return NullSummaryWriter()
+    from torch.utils.tensorboard import SummaryWriter
+
+    log_dir = Path(args.results_dir) / "tensorboard" / args.dataset / args.decoder
+    return SummaryWriter(log_dir=str(log_dir))
 
 
 def train(args) -> dict:
@@ -84,7 +88,7 @@ def train(args) -> dict:
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
     checkpoint_dir = Path(args.checkpoint_dir) / args.dataset / args.decoder
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(Path(args.results_dir) / "tensorboard" / args.dataset / args.decoder))
+    writer = make_summary_writer(args)
 
     global_step = 0
     last_loss = None
@@ -175,6 +179,7 @@ def build_arg_parser():
     parser.add_argument("--results_dir", default="results")
     parser.add_argument("--max_batches", type=int, default=None)
     parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--disable_tensorboard", action="store_true")
     parser.add_argument("--clip_model_name", default="openai/clip-vit-base-patch32")
     parser.add_argument("--pretrained_clip", type=str_to_bool, default=True)
     parser.add_argument("--no_pretrained_clip", dest="pretrained_clip", action="store_false")

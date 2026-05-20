@@ -49,6 +49,7 @@ def _policy_from_obs(args, decoder: str, obs: dict, device: torch.device) -> VLA
         tiny_random_clip=args.tiny_random_clip,
         decoder_hidden_dim=args.hidden_dim,
         decoder_num_layers=args.num_layers,
+        diffusion_train_steps=args.diffusion_train_steps,
         inference_steps=args.inference_steps,
     ).to(device)
 
@@ -161,6 +162,7 @@ def build_arg_parser():
     parser.add_argument("--tiny_random_clip", action="store_true")
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=3)
+    parser.add_argument("--diffusion_train_steps", type=int, default=100)
     parser.add_argument("--inference_steps", type=int, default=10)
     return parser
 

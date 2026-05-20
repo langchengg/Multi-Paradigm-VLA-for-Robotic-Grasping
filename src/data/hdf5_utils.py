@@ -43,8 +43,8 @@ def write_episode(path, episode_index: int, episode: dict) -> None:
         for key in ["target_pos", "target_quat"]:
             obj.create_dataset(key, data=np.asarray(episode["object_state"][key], dtype=np.float32))
 
-        group.attrs["dataset_name"] = episode.get("dataset_name", "synthetic")
-        group.attrs["target_name"] = episode.get("target_name", "")
+        group.attrs["dataset_name"] = str(episode.get("dataset_name", "synthetic"))
+        group.attrs["target_name"] = str(episode.get("target_name", ""))
 
 
 def read_episode(h5: h5py.File, episode_name: str) -> dict:
@@ -62,4 +62,3 @@ def read_episode(h5: h5py.File, episode_name: str) -> dict:
         "object_state": group["object_state"],
         "dataset_name": group.attrs.get("dataset_name", "synthetic"),
     }
-

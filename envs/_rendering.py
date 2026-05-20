@@ -2,6 +2,8 @@ import os
 import subprocess
 import sys
 
+import numpy as np
+
 
 HEADLESS_RENDER_BACKENDS = ("egl", "osmesa")
 HEADLESS_APT_INSTALL = (
@@ -48,6 +50,8 @@ def create_renderer(mujoco, model, height, width, *, environ=None, platform=None
     """Create a MuJoCo renderer with clearer headless failure modes."""
     environ = os.environ if environ is None else environ
     platform = sys.platform if platform is None else platform
+    if environ.get("VLA_MUJOCO_FAKE_RENDERER") == "1":
+        return FakeRenderer(height=height, width=width)
     backend = configure_headless_rendering(environ=environ, platform=platform)
     has_display = bool(environ.get("DISPLAY"))
 
@@ -65,6 +69,29 @@ def create_renderer(mujoco, model, height, width, *, environ=None, platform=None
                 platform=platform,
             )
         ) from exc
+
+
+class FakeRenderer:
+    """Explicit headless smoke-test renderer.
+
+    This is never used unless VLA_MUJOCO_FAKE_RENDERER=1 is set. It keeps
+    MuJoCo physics/control tests running in terminals that cannot create a
+    CoreGraphics/OpenGL context.
+    """
+
+    def __init__(self, height, width):
+        self.height = height
+        self.width = width
+        self.camera = None
+
+    def update_scene(self, _data, camera=None):
+        self.camera = camera
+
+    def render(self):
+        return np.zeros((self.height, self.width, 3), dtype=np.uint8)
+
+    def close(self):
+        return None
 
 
 def _requested_backend(environ):

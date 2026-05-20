@@ -102,7 +102,7 @@ def generate_synthetic_demos(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate HDF5 synthetic Franka grasp demos.")
-    parser.add_argument("--output", default="data/synthetic_demos.hdf5")
+    parser.add_argument("--output", dest="output_path", default="data/synthetic_demos.hdf5")
     parser.add_argument("--num_episodes", type=int, default=50)
     parser.add_argument("--image_size", type=int, default=128)
     parser.add_argument("--camera_name", default="frontview")
@@ -115,4 +115,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
