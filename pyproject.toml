@@ -9,10 +9,10 @@ description = "CLIP-conditioned action decoder benchmark for Franka Panda MuJoCo
 requires-python = ">=3.10"
 readme = "README.md"
 
-[tool.setuptools]
-packages = ["src"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-

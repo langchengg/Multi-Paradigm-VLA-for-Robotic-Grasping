@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch.nn as nn
 
-from models.diffusion_head import DiffusionHead
+from src.models.diffusion_head_impl import DiffusionHead
 
 
 class DiffusionActionDecoder(nn.Module):
@@ -37,4 +37,3 @@ class DiffusionActionDecoder(nn.Module):
 
     def sample(self, condition, num_steps=None):
         return self.head.sample(condition, num_steps=num_steps)
-

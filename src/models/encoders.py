@@ -34,7 +34,7 @@ class CLIPConditioningEncoder(nn.Module):
         self.robot_state_dim = int(robot_state_dim)
         self.clip_model_name = clip_model_name
         self.pretrained_clip = bool(pretrained_clip)
-        self.freeze_clip = bool(freeze_clip)
+        self.freeze_clip = bool(freeze_clip) and not bool(finetune_clip)
         self.finetune_clip = bool(finetune_clip)
         self.local_files_only = bool(local_files_only)
         self.tiny_random_clip = bool(tiny_random_clip)
@@ -98,13 +98,13 @@ class CLIPConditioningEncoder(nn.Module):
         self.vocab_size = int(self.clip.config.text_config.vocab_size)
         self.condition_dim = self.projection_dim * 2 + self.robot_state_dim
 
-        if self.freeze_clip and not self.finetune_clip:
+        if self.freeze_clip:
             self.clip.requires_grad_(False)
             self.clip.eval()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        if self.freeze_clip and not self.finetune_clip:
+        if self.freeze_clip:
             self.clip.eval()
         return self
 
@@ -168,4 +168,3 @@ class CLIPConditioningEncoder(nn.Module):
         image_features = F.normalize(image_features.float(), dim=-1)
         text_features = F.normalize(text_features.float(), dim=-1)
         return torch.cat([image_features, text_features, robot_state.float()], dim=-1)
-

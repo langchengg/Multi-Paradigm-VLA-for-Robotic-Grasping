@@ -58,7 +58,12 @@ def create_renderer(mujoco, model, height, width, *, environ=None, platform=None
         return mujoco.Renderer(model, height=height, width=width)
     except Exception as exc:
         raise RuntimeError(
-            _renderer_failure_message(exc, backend=backend, has_display=has_display)
+            _renderer_failure_message(
+                exc,
+                backend=backend,
+                has_display=has_display,
+                platform=platform,
+            )
         ) from exc
 
 
@@ -198,8 +203,14 @@ def _no_backend_message(failures, environ):
     return "\n".join(lines)
 
 
-def _renderer_failure_message(exc, *, backend, has_display):
+def _renderer_failure_message(exc, *, backend, has_display, platform=None):
     base = f"MuJoCo renderer initialization failed: {exc}"
+    if platform == "darwin" or str(platform).startswith("darwin"):
+        return (
+            f"{base}. On macOS this usually means Python is running without a valid "
+            "CoreGraphics GUI context. Retry from a normal Terminal session, or use "
+            "`mjpython -m src.visualization.live_watch --viewer` for interactive viewing."
+        )
     if not has_display:
         return (
             f"{base}. Headless Linux selected MUJOCO_GL={backend!r}. "
