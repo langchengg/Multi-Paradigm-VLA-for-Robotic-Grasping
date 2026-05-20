@@ -381,7 +381,45 @@ If you prefer separate notebooks, run the 3 notebook scripts in order:
 If Kaggle throws `RuntimeError: Numpy is not available` while loading OpenVLA, pin `numpy==1.26.4`. The install cells in Notebook 2 and 3 do this intentionally because `torch==2.2.0` can break against NumPy 2.x when remote OpenVLA processor code calls `tensor.numpy()`.
 Notebook 2 now auto-discovers `demo_*.npz` under common Kaggle mount points and can stream up to 500 real Franka robot samples from [`cadene/droid_1.0.1_v30`](https://huggingface.co/datasets/cadene/droid_1.0.1_v30). DROID v30 stores camera streams as MP4 shards rather than inline image columns, so the shared loader in `data/droid_utils.py` resolves each parquet row against its matching `meta/episodes/...` metadata and decodes the requested frame on demand. Both Notebook 2 and Notebook 3 import the same DROID-to-Franka conversion helpers, so training and offline evaluation use one shared action interface. The default Kaggle-fast preset also runs for 1 epoch. The single-entry Kaggle pipeline also deletes demos, adapter checkpoints, pip cache, and Hugging Face datasets cache after Notebook 2 unless you pass `--keep-intermediates`. If neither source yields data, it fails immediately instead of pretending external data was loaded.
 
-### Step 6: View Results
+### Step 6: Watch a Real OpenVLA Adapter in MuJoCo
+
+`scripts/run_demo.py` is intentionally a fast local pipeline and still uses `DummyVLA`.
+To use the real autoregressive VLA path, first produce or download a Notebook 2 adapter such as:
+
+```text
+openvla-finetuned/final/
+  adapter_config.json
+  adapter_model.safetensors
+  franka_action_config.json
+  ...
+```
+
+Then run the real-time MuJoCo rollout on a desktop with a working display:
+
+```bash
+python scripts/run_realtime_openvla_mujoco.py \
+  --adapter-dir /path/to/openvla-finetuned/final \
+  --local-base-dir /path/to/openvla-base \
+  --episodes 3 \
+  --target-object red_cube
+```
+
+The MuJoCo window shows the simulated 7-DOF Franka Panda arm moving in closed loop.
+The terminal prints the generated OpenVLA action tokens, parsed normalized 7-DOF action, physical delta, latency, reward, and success state.
+
+To monitor training checkpoints, point the viewer at the Notebook 2 output root:
+
+```bash
+python scripts/run_realtime_openvla_mujoco.py \
+  --watch-adapter-root /path/to/openvla-finetuned \
+  --local-base-dir /path/to/openvla-base \
+  --episodes 20
+```
+
+This reloads `final/` when it appears; before that it uses the highest numbered `checkpoint-*`.
+The viewer is a policy-behavior monitor, not a gradient visualizer: if training runs on Kaggle, copy or sync the adapter directory to the desktop machine running MuJoCo.
+
+### Step 7: View Results
 
 ```bash
 ls assets/
@@ -404,6 +442,7 @@ ls -lh assets_quick.zip
 ├── models/
 │   ├── flow_matching_head.py       # 🔥 Flow-matching action decoder (π0-inspired)
 │   ├── diffusion_head.py           # 🔥 Diffusion action decoder (DDPM/DDIM)
+│   ├── openvla_policy.py           # Real OpenVLA/PEFT policy wrapper for MuJoCo rollouts
 │   └── dummy_vla.py                # Dummy VLA implementing all 3 decoders for testing
 ├── data/
 │   ├── collect_demos.py            # Scripted expert demo collection
@@ -420,6 +459,7 @@ ls -lh assets_quick.zip
 │   └── 03_flow_matching_eval.py    # Kaggle: DROID offline train/eval comparison
 ├── scripts/
 │   ├── run_demo.py                 # One-click local quick pipeline in ~15 seconds
+│   ├── run_realtime_openvla_mujoco.py # Real OpenVLA adapter in the MuJoCo viewer
 │   └── run_kaggle_pipeline.py      # One-click Kaggle 1→2→3 orchestration
 ├── tests/
 │   ├── test_env.py                 # Unit tests (20/20 passing)

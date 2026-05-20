@@ -1,0 +1,8 @@
+env:
+  name: synthetic_franka_grasp
+  image_size: 128
+  camera_name: frontview
+  action_dim: 7
+  max_steps: 150
+  action_interface: [dx, dy, dz, dax, day, daz, gripper]
+

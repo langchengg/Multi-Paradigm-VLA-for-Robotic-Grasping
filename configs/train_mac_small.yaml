@@ -1,0 +1,16 @@
+training:
+  dataset: synthetic
+  data_path: data/synthetic_demos.hdf5
+  batch_size: 8
+  num_epochs: 2
+  device: auto
+  horizon: 16
+  learning_rate: 0.0003
+
+encoder:
+  name: clip
+  clip_model_name: openai/clip-vit-base-patch32
+  pretrained_clip: true
+  freeze_clip: true
+  finetune_clip: false
+

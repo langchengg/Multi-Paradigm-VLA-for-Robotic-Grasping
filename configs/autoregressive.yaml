@@ -1,0 +1,8 @@
+decoder:
+  name: autoregressive
+  horizon: 16
+  action_dim: 7
+  num_bins: 256
+  hidden_dim: 256
+  num_layers: 2
+

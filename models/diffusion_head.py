@@ -253,7 +253,7 @@ class DiffusionHead(nn.Module):
             alpha_prev = (
                 self.alphas_cumprod[timesteps[i + 1]]
                 if i + 1 < len(timesteps)
-                else torch.tensor(1.0)
+                else torch.tensor(1.0, device=device, dtype=x.dtype)
             )
 
             # Predict x_0

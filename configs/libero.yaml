@@ -1,0 +1,7 @@
+dataset:
+  name: libero
+  optional: true
+  suite: libero_object
+  horizon: 16
+  action_dim: auto
+

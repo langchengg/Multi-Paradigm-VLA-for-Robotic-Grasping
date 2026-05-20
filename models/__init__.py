@@ -3,5 +3,12 @@
 from .dummy_vla import DummyVLA
 from .diffusion_head import DiffusionHead
 from .flow_matching_head import FlowMatchingHead
+from .openvla_policy import OpenVLAPolicy, OpenVLAPolicyConfig
 
-__all__ = ["DiffusionHead", "DummyVLA", "FlowMatchingHead"]
+__all__ = [
+    "DiffusionHead",
+    "DummyVLA",
+    "FlowMatchingHead",
+    "OpenVLAPolicy",
+    "OpenVLAPolicyConfig",
+]
