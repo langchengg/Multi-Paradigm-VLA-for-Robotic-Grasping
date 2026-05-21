@@ -15,6 +15,7 @@ wandb/
 # Generated media and temporary outputs
 assets/**/*.gif
 !assets/grasp_demo.gif
+!assets/benchmark/*.gif
 assets/**/eval_results.txt
 *.mp4
 *.mov
@@ -24,4 +25,3 @@ assets/**/eval_results.txt
 .venv/
 venv/
 env/
-

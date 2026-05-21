@@ -278,15 +278,15 @@ Conclusion: after the magnetic soft grasp latch and extended 20-episode evaluati
 
 Comparison chart:
 
-![Final benchmark comparison](results/final_success_20of20/synthetic/comparison_metrics.png)
+![Final benchmark comparison](assets/benchmark/comparison_metrics.png)
 
 Successful rollout GIFs:
 
-![Autoregressive successful grasp](results/final_success_20of20/synthetic/success_gifs/autoregressive_success.gif)
+![Autoregressive successful grasp](assets/benchmark/autoregressive_success.gif)
 
-![Diffusion successful grasp](results/final_success_20of20/synthetic/success_gifs/diffusion_success.gif)
+![Diffusion successful grasp](assets/benchmark/diffusion_success.gif)
 
-![Flow-Matching successful grasp](results/final_success_20of20/synthetic/success_gifs/flow_matching_success.gif)
+![Flow-Matching successful grasp](assets/benchmark/flow_matching_success.gif)
 
 Viewer verification:
 
