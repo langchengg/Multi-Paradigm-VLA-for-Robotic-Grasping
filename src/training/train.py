@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
+import h5py
+import numpy as np
 
 from src.data.common_dataset import VLADataset, collate_vla_batch
 from src.data.libero_adapter import LiberoVLADataset
@@ -33,6 +35,20 @@ def build_dataset(args):
     if args.dataset == "libero":
         return LiberoVLADataset(args.data_path, horizon=args.horizon, suite=args.libero_suite)
     raise ValueError(f"Unknown dataset: {args.dataset}")
+
+
+def compute_action_stats(dataset) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    """Compute per-dimension action stats for continuous generative decoders."""
+    if not isinstance(dataset, VLADataset):
+        return None, None
+    actions = []
+    with h5py.File(dataset.hdf5_path, "r") as h5:
+        for episode in dataset._episode_lengths:
+            actions.append(np.asarray(h5[episode]["actions"], dtype=np.float32))
+    if not actions:
+        return None, None
+    stacked = np.concatenate(actions, axis=0)
+    return stacked.mean(axis=0), stacked.std(axis=0)
 
 
 class NullSummaryWriter:
@@ -83,6 +99,15 @@ def train(args) -> dict:
         inference_steps=args.inference_steps,
         num_action_bins=args.num_action_bins,
     ).to(device)
+
+    action_mean, action_std = compute_action_stats(dataset)
+    decoder_head = getattr(policy.decoder, "head", None)
+    if decoder_head is not None and hasattr(decoder_head, "set_action_stats") and action_mean is not None:
+        decoder_head.set_action_stats(action_mean, action_std)
+        print(
+            "[train] action stats mean="
+            f"{np.round(action_mean, 4).tolist()} std={np.round(action_std, 4).tolist()}"
+        )
 
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -155,6 +180,8 @@ def train(args) -> dict:
         "last_loss": last_loss,
         "device": str(device),
         "trainable_parameters": sum(p.numel() for p in trainable_params),
+        "action_mean": action_mean.tolist() if action_mean is not None else None,
+        "action_std": action_std.tolist() if action_std is not None else None,
     }
     (checkpoint_dir / "train_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"[train] saved {latest}")

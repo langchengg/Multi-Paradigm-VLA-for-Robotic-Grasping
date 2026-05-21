@@ -24,40 +24,53 @@ def scripted_grasp_policy(obs: dict, phase: int, phase_step: int, target_pos) ->
 
     if phase == 0:
         goal = target_pos.copy()
-        goal[2] += 0.07
+        goal[2] += 0.08
         direction = goal - gripper_pos
-        action[:3] = direction * np.array([8.0, 8.0, 7.0], dtype=np.float32)
+        action[:3] = direction * np.array([7.5, 7.5, 6.0], dtype=np.float32)
         action[6] = -1.0
-        if np.linalg.norm(direction) < 0.018 or phase_step >= 35:
+        if np.linalg.norm(direction) < 0.015 or phase_step >= 45:
             return np.clip(action, -1.0, 1.0), 1, 0
         return np.clip(action, -1.0, 1.0), 0, phase_step + 1
 
     if phase == 1:
         goal = target_pos.copy()
-        goal[2] += 0.015
+        goal[2] -= 0.055
         direction = goal - gripper_pos
-        action[:3] = direction * np.array([7.0, 7.0, 6.0], dtype=np.float32)
+        xy_error = np.linalg.norm(direction[:2])
+        action[:3] = direction * np.array([4.5, 4.5, 4.0], dtype=np.float32)
         action[6] = -1.0
-        if np.linalg.norm(direction) < 0.012 or phase_step >= 35:
+        at_grasp_depth = gripper_pos[2] <= target_pos[2] + 0.015
+        if (at_grasp_depth and xy_error < 0.055) or phase_step >= 100:
             return np.clip(action, -1.0, 1.0), 2, 0
         return np.clip(action, -1.0, 1.0), 1, phase_step + 1
 
     if phase == 2:
         goal = target_pos.copy()
-        goal[2] += 0.01
+        goal[2] -= 0.055
         direction = goal - gripper_pos
-        action[:3] = direction * np.array([4.0, 4.0, 3.0], dtype=np.float32)
+        action[:3] = direction * np.array([1.5, 1.5, 1.0], dtype=np.float32)
         action[6] = 1.0
-        if phase_step >= 15:
+        gripper_width = float(np.asarray(obs["robot_state"].get("gripper", [0.08]))[0])
+        if (phase_step >= 12 and gripper_width < 0.045) or phase_step >= 45:
             return np.clip(action, -1.0, 1.0), 3, 0
         return np.clip(action, -1.0, 1.0), 2, phase_step + 1
+
+    if phase == 3:
+        goal = target_pos.copy()
+        goal[2] = 0.34
+        direction = goal - gripper_pos
+        action[:3] = direction * np.array([1.2, 1.2, 1.5], dtype=np.float32)
+        action[6] = 1.0
+        if phase_step >= 60 or gripper_pos[2] > 0.32:
+            return np.clip(action, -1.0, 1.0), 4, 0
+        return np.clip(action, -1.0, 1.0), 3, phase_step + 1
 
     goal = target_pos.copy()
     goal[2] = 0.56
     direction = goal - gripper_pos
-    action[:3] = direction * np.array([3.5, 3.5, 4.5], dtype=np.float32)
+    action[:3] = direction * np.array([1.5, 1.5, 2.5], dtype=np.float32)
     action[6] = 1.0
-    return np.clip(action, -1.0, 1.0), 3, phase_step + 1
+    return np.clip(action, -1.0, 1.0), 4, phase_step + 1
 
 
 class ScriptedGraspController:
@@ -83,4 +96,3 @@ class ScriptedGraspController:
             self.target_pos,
         )
         return action
-

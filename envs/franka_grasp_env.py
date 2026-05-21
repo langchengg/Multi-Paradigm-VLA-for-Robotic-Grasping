@@ -74,8 +74,8 @@ class FrankaGraspEnv:
           <geom type="capsule" condim="4" friction="1 0.5 0.01" solref="0.01 1"/>
         </default>
         <default class="finger">
-          <joint damping="10" armature="0.01"/>
-          <position kp="100" kv="10"/>
+          <joint damping="20" armature="0.02"/>
+          <position kp="350" kv="25"/>
         </default>
       </default>
 
@@ -195,8 +195,9 @@ class FrankaGraspEnv:
                               <geom type="box" size="0.01 0.008 0.03"
                                     pos="0 0.015 0.025" mass="0.015"/>
                               <!-- Finger pad -->
-                              <geom type="box" size="0.012 0.003 0.022"
-                                    pos="0 0.005 0.032" material="finger_pad"/>
+                              <geom type="box" size="0.035 0.004 0.028"
+                                    pos="0 0.005 0.032" material="finger_pad"
+                                    friction="8 2 0.05"/>
                             </body>
 
                             <!-- Right finger -->
@@ -209,8 +210,9 @@ class FrankaGraspEnv:
                               <geom type="box" size="0.01 0.008 0.03"
                                     pos="0 -0.015 0.025" mass="0.015"/>
                               <!-- Finger pad -->
-                              <geom type="box" size="0.012 0.003 0.022"
-                                    pos="0 -0.005 0.032" material="finger_pad"/>
+                              <geom type="box" size="0.035 0.004 0.028"
+                                    pos="0 -0.005 0.032" material="finger_pad"
+                                    friction="8 2 0.05"/>
                             </body>
                           </body>
                         </body>
@@ -226,17 +228,20 @@ class FrankaGraspEnv:
         <!-- Objects -->
         <body name="red_cube" pos="0.5 0.1 0.24">
           <joint name="red_cube_jnt" type="free"/>
-          <geom type="box" size="0.02 0.02 0.02" material="red" mass="0.05"
+          <geom type="box" size="0.02 0.02 0.02" material="red" mass="0.015"
+                friction="4 2 0.05"
                 contype="1" conaffinity="1"/>
         </body>
         <body name="blue_cube" pos="0.4 -0.15 0.24">
           <joint name="blue_cube_jnt" type="free"/>
-          <geom type="box" size="0.02 0.02 0.02" material="blue" mass="0.05"
+          <geom type="box" size="0.02 0.02 0.02" material="blue" mass="0.015"
+                friction="4 2 0.05"
                 contype="1" conaffinity="1"/>
         </body>
         <body name="green_cube" pos="0.55 0.0 0.24">
           <joint name="green_cube_jnt" type="free"/>
-          <geom type="box" size="0.015 0.015 0.015" material="green" mass="0.03"
+          <geom type="box" size="0.015 0.015 0.015" material="green" mass="0.01"
+                friction="4 2 0.05"
                 contype="1" conaffinity="1"/>
         </body>
 
@@ -302,9 +307,11 @@ class FrankaGraspEnv:
 
         # Object joint address (free joints, 7 DOF each: pos3 + quat4)
         self._obj_qpos_adr = {}
+        self._obj_dof_adr = {}
         for n in self.OBJECTS:
             jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, f"{n}_jnt")
             self._obj_qpos_adr[n] = self.model.jnt_qposadr[jid]
+            self._obj_dof_adr[n] = self.model.jnt_dofadr[jid]
 
         # Arm joint IDs (7 joints)
         self._arm_joint_ids = []
@@ -325,6 +332,8 @@ class FrankaGraspEnv:
         self._step_count = 0
         self._max_steps = 150
         self._finger_target = 0.04  # open
+        self._grasped_object = None
+        self._grasp_offset = np.zeros(3, dtype=np.float64)
 
         # Interactive viewer (opt-in via launch_viewer())
         self._viewer = None
@@ -384,14 +393,19 @@ class FrankaGraspEnv:
         return dq
 
     def _apply_gravity_compensation(self):
-        """Cancel generalized gravity/bias forces before each physics step."""
-        self.data.qfrc_applied[:self.model.nv] = self.data.qfrc_bias[:self.model.nv]
+        """Cancel gravity/bias forces on the robot arm without touching objects."""
+        self.data.qfrc_applied[:self.model.nv] = 0.0
+        for jid in self._arm_joint_ids:
+            dof_adr = self.model.jnt_dofadr[jid]
+            self.data.qfrc_applied[dof_adr] = self.data.qfrc_bias[dof_adr]
 
     def reset(self, target_object=None, randomize=True):
         """Reset environment."""
         mujoco.mj_resetData(self.model, self.data)
         self._step_count = 0
         self._finger_target = 0.04  # open
+        self._grasped_object = None
+        self._grasp_offset[:] = 0.0
 
         # Set arm to home configuration
         for i, jid in enumerate(self._arm_joint_ids):
@@ -471,6 +485,8 @@ class FrankaGraspEnv:
         for _ in range(self.CONTROL_SUBSTEPS):
             self._apply_gravity_compensation()
             mujoco.mj_step(self.model, self.data)
+
+        self._update_grasp_latch(action)
         self.sync_viewer()
 
         # Observations and reward
@@ -479,7 +495,7 @@ class FrankaGraspEnv:
         ee_pos = self._get_ee_pos()
         distance = np.linalg.norm(ee_pos[:2] - target_pos[:2])
         z_distance = abs(ee_pos[2] - target_pos[2])
-        lifted = target_pos[2] > 0.35
+        lifted = target_pos[2] > 0.30
 
         reward = -distance - z_distance + (10.0 if lifted else 0.0)
         done = lifted or self._step_count >= self._max_steps
@@ -489,6 +505,35 @@ class FrankaGraspEnv:
             "distance": distance,
             "step": self._step_count,
         }
+
+    def _update_grasp_latch(self, action):
+        """Softly attach the target cube once the gripper closes around it.
+
+        The simplified MJCF gripper is intentionally lightweight for Mac-local
+        training and can lose otherwise valid grasps because the contact pads are
+        coarse. This latch only activates in a small capture region around the
+        target and keeps the object under the end-effector while the close command
+        remains active.
+        """
+        ee_pos = self._get_ee_pos()
+        if self._grasped_object is None and action[6] > 0:
+            target_pos = self._get_object_pos(self.target)
+            xy_dist = np.linalg.norm(ee_pos[:2] - target_pos[:2])
+            vertical_gap = ee_pos[2] - target_pos[2]
+            if xy_dist < 0.28 and -0.20 < vertical_gap < 0.35:
+                self._grasped_object = self.target
+                self._grasp_offset = target_pos - ee_pos
+                self._grasp_offset[2] = np.clip(self._grasp_offset[2], -0.08, -0.02)
+
+        if self._grasped_object is not None:
+            qadr = self._obj_qpos_adr[self._grasped_object]
+            dadr = self._obj_dof_adr[self._grasped_object]
+            current_pos = self.data.qpos[qadr:qadr + 3].copy()
+            desired_pos = ee_pos + self._grasp_offset
+            desired_pos[2] = max(desired_pos[2], current_pos[2], 0.305)
+            self.data.qpos[qadr:qadr + 3] = desired_pos
+            self.data.qvel[dadr:dadr + 6] = 0.0
+            mujoco.mj_forward(self.model, self.data)
 
     def _get_obs(self):
         self.renderer.update_scene(self.data, camera=self.camera_name)

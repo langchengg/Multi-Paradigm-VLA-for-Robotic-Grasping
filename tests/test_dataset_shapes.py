@@ -34,10 +34,10 @@ def test_vla_dataset_shapes(tmp_path):
     item = dataset[0]
     assert len(dataset) == 5
     assert dataset.action_dim == 7
-    assert dataset.robot_state_dim == 26
+    assert dataset.robot_state_dim == 36
     assert item["image"].shape == (3, 16, 16)
     assert item["action_chunk"].shape == (4, 7)
-    assert item["robot_state"].shape == (26,)
+    assert item["robot_state"].shape == (36,)
     assert item["instruction"] == "pick up the red cube"
 
 
@@ -48,6 +48,5 @@ def test_vla_collate_shapes(tmp_path):
     batch = collate_vla_batch([dataset[0], dataset[1]])
     assert batch["image"].shape == (2, 3, 16, 16)
     assert batch["action_chunk"].shape == (2, 4, 7)
-    assert batch["robot_state"].shape == (2, 26)
+    assert batch["robot_state"].shape == (2, 36)
     assert batch["instruction"] == ["pick up the red cube", "pick up the red cube"]
-

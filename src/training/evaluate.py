@@ -19,10 +19,11 @@ from src.training.metrics import (
     summarize_rollouts,
     trajectory_smoothness,
 )
-from src.utils.checkpoints import latest_checkpoint, load_checkpoint
+from src.utils.checkpoints import apply_checkpoint_config, latest_checkpoint, load_checkpoint
 from src.utils.device import get_device
 from src.utils.logging import write_json
 from src.utils.seeding import seed_everything
+from src.visualization.plots import write_comparison_csv, write_comparison_plot
 from src.visualization.record_video import save_video
 
 
@@ -35,7 +36,7 @@ def str_to_bool(value) -> bool:
 def _policy_from_obs(args, decoder: str, obs: dict, device: torch.device) -> VLAPolicy:
     from src.envs.wrappers import flatten_robot_state
 
-    robot_state_dim = flatten_robot_state(obs["robot_state"]).shape[0]
+    robot_state_dim = flatten_robot_state(obs["robot_state"], obs.get("object_state")).shape[0]
     return VLAPolicy(
         decoder_type=decoder,
         robot_state_dim=robot_state_dim,
@@ -58,14 +59,17 @@ def evaluate_decoder(args, decoder: str) -> dict:
     seed_everything(args.seed)
     device = get_device(args.device)
     env = SyntheticFrankaGraspEnv(image_size=args.image_size, camera_name=args.camera_name)
+    env._max_steps = args.max_steps
     controller = ScriptedGraspController()
     rollouts = []
     saved_videos = []
     try:
         obs = env.reset(randomize=True)
-        policy = _policy_from_obs(args, decoder, obs, device)
+        env._max_steps = args.max_steps
         ckpt_dir = Path(args.checkpoint_dir) / args.dataset / decoder
         ckpt = latest_checkpoint(ckpt_dir)
+        policy_args = apply_checkpoint_config(args, ckpt)
+        policy = _policy_from_obs(policy_args, decoder, obs, device)
         if ckpt is not None:
             load_checkpoint(ckpt, policy, map_location=device)
             print(f"[eval] loaded {ckpt}")
@@ -75,6 +79,7 @@ def evaluate_decoder(args, decoder: str) -> dict:
 
         for episode in range(args.num_episodes):
             obs = env.reset(randomize=True)
+            env._max_steps = args.max_steps
             controller.reset(obs)
             pred_actions = []
             expert_actions = []
@@ -83,21 +88,26 @@ def evaluate_decoder(args, decoder: str) -> dict:
             latencies = []
             info = {"success": False}
             episode_frames = []
-            for _step in range(args.max_steps):
-                expert = controller.act(obs)
+            step = 0
+            while step < args.max_steps:
                 start = time.perf_counter()
                 chunk = policy.predict_action_chunk_from_obs(obs, device)
                 latency_ms = (time.perf_counter() - start) * 1000.0
-                action = chunk[0, 0].detach().cpu().numpy().astype(np.float32)
-                action = np.clip(action, -1.0, 1.0)
-                pred_actions.append(action)
-                expert_actions.append(expert)
                 latencies.append(latency_ms)
-                xy_errors.append(float(np.linalg.norm(obs["robot_state"]["eef_pos"][:2] - obs["object_state"]["target_pos"][:2])))
-                if args.save_video:
-                    episode_frames.append(obs["image"])
-                obs, reward, done, info = env.step(action)
-                rewards.append(float(reward))
+                chunk_np = chunk[0].detach().cpu().numpy().astype(np.float32)
+                for chunk_step in range(min(args.exec_chunk_steps, chunk_np.shape[0])):
+                    expert = controller.act(obs)
+                    action = np.clip(chunk_np[chunk_step], -1.0, 1.0)
+                    pred_actions.append(action)
+                    expert_actions.append(expert)
+                    xy_errors.append(float(np.linalg.norm(obs["robot_state"]["eef_pos"][:2] - obs["object_state"]["target_pos"][:2])))
+                    if args.save_video:
+                        episode_frames.append(obs["image"])
+                    obs, reward, done, info = env.step(action)
+                    rewards.append(float(reward))
+                    step += 1
+                    if done or step >= args.max_steps:
+                        break
                 if done:
                     break
             final_height = float(obs["object_state"]["target_pos"][2])
@@ -112,7 +122,7 @@ def evaluate_decoder(args, decoder: str) -> dict:
                 "action_mse": action_mse(pred_actions, expert_actions),
                 "trajectory_smoothness": trajectory_smoothness(pred_actions),
                 "inference_latency_ms": float(np.mean(latencies) if latencies else 0.0),
-                "number_of_inference_steps": 1 if decoder == "autoregressive" else args.inference_steps,
+                "number_of_inference_steps": 1 if decoder == "autoregressive" else policy_args.inference_steps,
                 "gripper_timing_error": gripper_timing_error(pred_actions, expert_actions),
                 "failure_type": failure,
             }
@@ -164,6 +174,7 @@ def build_arg_parser():
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--diffusion_train_steps", type=int, default=100)
     parser.add_argument("--inference_steps", type=int, default=10)
+    parser.add_argument("--exec_chunk_steps", type=int, default=1)
     return parser
 
 
@@ -177,6 +188,8 @@ def main() -> None:
         json.dumps(summaries, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    write_comparison_csv(summaries, comparison_dir / "comparison_metrics.csv")
+    write_comparison_plot(summaries, comparison_dir / "comparison_metrics.png")
 
 
 if __name__ == "__main__":

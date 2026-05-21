@@ -42,7 +42,13 @@ class VLADataset(Dataset):
             if self._index:
                 first_ep = self._index[0][0]
                 self._action_dim = int(h5[first_ep]["actions"].shape[-1])
-                self._robot_state_dim = int(self._flatten_robot_state(h5[first_ep]["robot_state"], 0).shape[0])
+                self._robot_state_dim = int(
+                    self._flatten_robot_state(
+                        h5[first_ep]["robot_state"],
+                        0,
+                        h5[first_ep].get("object_state"),
+                    ).shape[0]
+                )
 
     @property
     def action_dim(self) -> int:
@@ -55,7 +61,7 @@ class VLADataset(Dataset):
     def __len__(self):
         return len(self._index)
 
-    def _flatten_robot_state(self, robot_group, t: int) -> np.ndarray:
+    def _flatten_robot_state(self, robot_group, t: int, object_group=None) -> np.ndarray:
         parts = [
             np.asarray(robot_group["eef_pos"][t], dtype=np.float32).reshape(-1),
             np.asarray(robot_group["eef_quat"][t], dtype=np.float32).reshape(-1),
@@ -63,6 +69,14 @@ class VLADataset(Dataset):
             np.asarray(robot_group["qpos"][t], dtype=np.float32).reshape(-1),
             np.asarray(robot_group["qvel"][t], dtype=np.float32).reshape(-1),
         ]
+        if object_group is not None:
+            target_pos = np.asarray(object_group["target_pos"][t], dtype=np.float32).reshape(-1)
+            eef_pos = np.asarray(robot_group["eef_pos"][t], dtype=np.float32).reshape(-1)
+            parts.extend([
+                target_pos,
+                np.asarray(object_group["target_quat"][t], dtype=np.float32).reshape(-1),
+                target_pos - eef_pos,
+            ])
         return np.concatenate(parts, axis=0).astype(np.float32)
 
     def _action_chunk(self, actions: np.ndarray, t: int) -> np.ndarray:
@@ -83,7 +97,9 @@ class VLADataset(Dataset):
                 raise ValueError(f"Expected image [H,W,3], found {image.shape}")
             image = torch.from_numpy(image).permute(2, 0, 1) / 255.0
 
-            robot_state = torch.from_numpy(self._flatten_robot_state(group["robot_state"], t))
+            robot_state = torch.from_numpy(
+                self._flatten_robot_state(group["robot_state"], t, group.get("object_state"))
+            )
             actions = np.asarray(group["actions"], dtype=np.float32)
             action_chunk = torch.from_numpy(self._action_chunk(actions, t))
 
@@ -110,4 +126,3 @@ def collate_vla_batch(batch: list[dict]) -> dict:
         "success": torch.tensor([item["success"] for item in batch], dtype=torch.bool),
         "dataset_name": [item["dataset_name"] for item in batch],
     }
-

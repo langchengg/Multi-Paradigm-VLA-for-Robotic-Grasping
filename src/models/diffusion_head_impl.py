@@ -112,9 +112,21 @@ class DiffusionHead(nn.Module):
             ])
         self.noise_net = nn.Sequential(*layers)
 
+        self.prior_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, self.total_action_dim),
+        )
+
         # ── Action normalization stats ──
         self.register_buffer("action_mean", torch.zeros(action_dim))
         self.register_buffer("action_std", torch.ones(action_dim))
+        action_loss_weight = torch.ones(action_dim)
+        action_loss_weight[:3] = 2.0
+        action_loss_weight[3:6] = 0.25
+        action_loss_weight[6] = 6.0
+        self.register_buffer("action_loss_weight", action_loss_weight)
 
         self._init_weights()
 
@@ -197,10 +209,20 @@ class DiffusionHead(nn.Module):
         )
 
         # Denoising loss
-        loss = F.mse_loss(pred_noise, noise)
+        noise_loss = F.mse_loss(pred_noise, noise)
+        pred_x0 = (x_t - sqrt_one_minus_alpha * pred_noise) / sqrt_alpha
+        x0_weight = (1.0 - self.alphas_cumprod[t]).unsqueeze(-1)
+        x0_loss = (x0_weight * (pred_x0 - action_norm).pow(2)).mean()
+        prior = self.prior_net(proj_features)
+        flat_weight = self.action_loss_weight.repeat(self.action_horizon).to(action_norm.device)
+        prior_loss = (flat_weight * (prior - action_norm).pow(2)).mean()
+        loss = noise_loss + 0.01 * x0_loss + 5.0 * prior_loss
 
         info = {
             "diffusion_loss": loss.item(),
+            "diffusion_noise_loss": noise_loss.item(),
+            "diffusion_x0_loss": x0_loss.item(),
+            "diffusion_prior_loss": prior_loss.item(),
             "noise_pred_norm": pred_noise.norm(dim=-1).mean().item(),
         }
 
@@ -225,6 +247,7 @@ class DiffusionHead(nn.Module):
         device = features.device
 
         proj_features = self.feature_proj(features)
+        prior = self.prior_net(proj_features)
 
         # Start from pure noise
         x = torch.randn(B, self.total_action_dim, device=device)
@@ -267,6 +290,8 @@ class DiffusionHead(nn.Module):
 
             # x_{t-1}
             x = torch.sqrt(alpha_prev) * pred_x0 + dir_xt
+
+        x = 0.05 * x + 0.95 * prior
 
         # Denormalize and reshape
         actions = self.denormalize_action(

@@ -99,11 +99,12 @@ class VLAPolicy(nn.Module):
     @torch.no_grad()
     def predict_action_chunk_from_obs(self, obs: dict, device: torch.device) -> torch.Tensor:
         image = torch.from_numpy(np.asarray(obs["image"], dtype=np.float32)).permute(2, 0, 1).unsqueeze(0) / 255.0
-        robot_state = torch.from_numpy(flatten_robot_state(obs["robot_state"])).unsqueeze(0)
+        robot_state = torch.from_numpy(
+            flatten_robot_state(obs["robot_state"], obs.get("object_state"))
+        ).unsqueeze(0)
         batch = {
             "image": image.to(device),
             "instruction": [obs["instruction"]],
             "robot_state": robot_state.to(device),
         }
         return self.predict_action_chunk(batch)
-

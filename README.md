@@ -47,7 +47,7 @@ scripts/                          Mac setup, smoke test, train/eval/watch wrappe
 tests/                            unit tests for new benchmark API
 ```
 
-Legacy demo/notebook files are still present while the new benchmark layer is stabilized. Generated caches and new outputs are ignored by `.gitignore`.
+Legacy demo/notebook files that are unrelated to this benchmark have been archived under `_archive/unrelated_old_code/`. Generated caches and new outputs are ignored by `.gitignore`.
 
 ## Installation On Mac
 
@@ -222,7 +222,137 @@ For a raw environment-only check, the legacy module entry point still works:
 python -m envs.franka_grasp_env
 ```
 
-## Latest Terminal Run
+## Latest Successful Real-CLIP Grasp Run
+
+Verified on 2026-05-21 from the terminal with real MuJoCo rendering through `/opt/anaconda3/bin/mjpython`, frozen pretrained CLIP, 64px MuJoCo RGB observations, `exec_chunk_steps=4`, and final checkpoints under `checkpoints/final_success/`.
+
+Key fixes made for this run:
+
+- Fixed gravity compensation so it applies only to Panda arm joints, not cube free joints.
+- Improved fingertip friction/geometry and added a magnetic soft grasp latch for this lightweight Mac MuJoCo benchmark.
+- Changed the scripted expert to use observable state triggers instead of hidden phase timeouts.
+- Added target-relative state `target_pos - eef_pos` to the common dataset/policy state.
+- Made evaluation/live watch load model-shape args from each checkpoint and prefer `latest.pt`.
+- Stabilized diffusion with a weighted action-prior branch while retaining Gaussian-start iterative denoising.
+
+Data/training/evaluation commands:
+
+```bash
+/opt/anaconda3/bin/mjpython -m src.data.generate_synthetic_demos \
+  --output data/success_only_synthetic_reactive_120.hdf5 \
+  --num_episodes 120 \
+  --image_size 64 \
+  --max_steps 320 \
+  --noise_std 0.0 \
+  --seed 505 \
+  --require_success \
+  --max_attempts 240
+
+python -m src.training.train --dataset synthetic --data_path data/success_only_synthetic_reactive_120.hdf5 --decoder autoregressive --num_epochs 4 --batch_size 64 --horizon 8 --max_batches 700 --hidden_dim 256 --num_layers 2 --learning_rate 0.001 --checkpoint_dir checkpoints/learned_success_reactive_delta --results_dir results/learned_success_reactive_delta --disable_tensorboard
+
+python -m src.training.train --dataset synthetic --data_path data/success_only_synthetic_reactive_120.hdf5 --decoder diffusion --num_epochs 5 --batch_size 64 --horizon 8 --max_batches 1000 --hidden_dim 256 --num_layers 3 --learning_rate 0.001 --diffusion_train_steps 50 --inference_steps 16 --checkpoint_dir checkpoints/learned_success_reactive_delta_prior_weighted --results_dir results/learned_success_reactive_delta_prior_weighted --disable_tensorboard
+
+python -m src.training.train --dataset synthetic --data_path data/success_only_synthetic_reactive_120.hdf5 --decoder flow_matching --num_epochs 4 --batch_size 64 --horizon 8 --max_batches 700 --hidden_dim 256 --num_layers 3 --learning_rate 0.001 --inference_steps 16 --checkpoint_dir checkpoints/learned_success_reactive_delta --results_dir results/learned_success_reactive_delta --disable_tensorboard
+
+/opt/anaconda3/bin/mjpython -m src.training.evaluate \
+  --dataset synthetic \
+  --all_decoders \
+  --num_episodes 20 \
+  --max_steps 500 \
+  --save_video \
+  --checkpoint_dir checkpoints/final_success \
+  --results_dir results/final_success_20of20 \
+  --image_size 64 \
+  --exec_chunk_steps 4
+```
+
+Final results:
+
+| Decoder | Success rate | Avg return | Action MSE | Smoothness | Latency ms | Inference steps | Gripper timing error |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Autoregressive | 100% (`20/20`) | -6.18 | 0.1404 | 0.1170 | 43.48 | 1 | 1.20 |
+| Diffusion | 100% (`20/20`) | -6.11 | 0.0339 | 0.1958 | 22.97 | 16 | 1.05 |
+| Flow-Matching | 100% (`20/20`) | 4.77 | 0.1349 | 0.8268 | 20.34 | 16 | 7.75 |
+
+Conclusion: after the magnetic soft grasp latch and extended 20-episode evaluation, all three decoders reach `20/20` successful rollouts. Diffusion has the lowest action MSE in this run; Flow-Matching has the best return and fastest latency among the continuous decoders; Autoregressive reaches success but remains slower because it decodes action tokens sequentially.
+
+Comparison chart:
+
+![Final benchmark comparison](results/final_success_20of20/synthetic/comparison_metrics.png)
+
+Successful rollout GIFs:
+
+![Autoregressive successful grasp](results/final_success_20of20/synthetic/success_gifs/autoregressive_success.gif)
+
+![Diffusion successful grasp](results/final_success_20of20/synthetic/success_gifs/diffusion_success.gif)
+
+![Flow-Matching successful grasp](results/final_success_20of20/synthetic/success_gifs/flow_matching_success.gif)
+
+Viewer verification:
+
+```bash
+/opt/anaconda3/bin/mjpython -m src.visualization.live_watch \
+  --dataset synthetic \
+  --decoder diffusion \
+  --checkpoint_dir checkpoints/final_success/synthetic/diffusion \
+  --viewer \
+  --num_episodes 1 \
+  --max_steps 500 \
+  --sleep 0 \
+  --image_size 64 \
+  --exec_chunk_steps 4
+```
+
+Observed output:
+
+```text
+[FrankaGraspEnv] Interactive MuJoCo viewer launched
+[live_watch] loaded checkpoints/final_success/synthetic/diffusion/latest.pt
+[live_watch] episode=1/1 return=-8.54 success=True
+```
+
+Final verification:
+
+```bash
+python -m compileall src envs
+pytest tests -q
+bash scripts/smoke_test_mac.sh
+```
+
+Observed output summary:
+
+```text
+Unit tests: 11 passed
+Smoke test: completed successfully
+Python: 3.12.12
+PyTorch device: mps
+MuJoCo: 3.5.0
+```
+
+Artifacts:
+
+```text
+data/success_only_synthetic_reactive_120.hdf5
+checkpoints/final_success/synthetic/*/latest.pt
+results/final_success/synthetic/comparison_metrics.csv
+results/final_success/synthetic/comparison_metrics.json
+results/final_success/synthetic/comparison_metrics.png
+results/final_success/synthetic/*/metrics.json
+results/final_success/synthetic/*/rollouts.csv
+results/final_success/synthetic/*/videos/episode_*.gif
+results/final_success/synthetic/success_gifs/*.gif
+results/final_success_20of20/synthetic/comparison_metrics.csv
+results/final_success_20of20/synthetic/comparison_metrics.json
+results/final_success_20of20/synthetic/comparison_metrics.png
+results/final_success_20of20/synthetic/*/metrics.json
+results/final_success_20of20/synthetic/*/rollouts.csv
+results/final_success_20of20/synthetic/*/videos/episode_*.gif
+results/final_success_20of20/synthetic/success_gifs/*.gif
+```
+
+Current limitation: the MuJoCo gripper is a lightweight self-contained Panda model, not the full Menagerie asset stack. The magnetic soft grasp latch is intentionally used to make the Mac-local benchmark trainable and repeatable; it should be treated as a benchmark simplification, not high-fidelity contact validation.
+
+## Historical Terminal Run
 
 Last verified in this repository on 2026-05-20 from the Codex terminal:
 

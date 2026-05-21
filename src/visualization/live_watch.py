@@ -10,7 +10,7 @@ import torch
 from src.envs.synthetic_franka_grasp_env import SyntheticFrankaGraspEnv
 from src.envs.wrappers import flatten_robot_state
 from src.models.policy import VLAPolicy
-from src.utils.checkpoints import latest_checkpoint, load_checkpoint
+from src.utils.checkpoints import apply_checkpoint_config, latest_checkpoint, load_checkpoint
 from src.utils.device import get_device
 from src.visualization.viewer import try_launch_viewer
 
@@ -22,7 +22,7 @@ def str_to_bool(value) -> bool:
 
 
 def make_policy(args, obs, device):
-    robot_state_dim = flatten_robot_state(obs["robot_state"]).shape[0]
+    robot_state_dim = flatten_robot_state(obs["robot_state"], obs.get("object_state")).shape[0]
     return VLAPolicy(
         decoder_type=args.decoder,
         robot_state_dim=robot_state_dim,
@@ -44,31 +44,40 @@ def make_policy(args, obs, device):
 def live_watch(args) -> None:
     device = get_device(args.device)
     env = SyntheticFrankaGraspEnv(image_size=args.image_size, camera_name=args.camera_name)
+    env._max_steps = args.max_steps
     try:
         if args.viewer and not try_launch_viewer(env):
             print("[live_watch] Continuing headless; frames are still rendered through MuJoCo offscreen rendering.")
 
-        obs = env.reset(randomize=True)
-        policy = make_policy(args, obs, device)
         checkpoint_dir = Path(args.checkpoint_dir)
-        last_checkpoint = None
-        last_reload_time = 0.0
         if not checkpoint_dir.exists():
             alt = Path("checkpoints") / args.dataset / args.decoder
             if alt.exists():
                 checkpoint_dir = alt
+        obs = env.reset(randomize=True)
+        env._max_steps = args.max_steps
+        ckpt = latest_checkpoint(checkpoint_dir)
+        policy_args = apply_checkpoint_config(args, ckpt)
+        policy = make_policy(policy_args, obs, device)
+        last_checkpoint = None
+        last_reload_time = 0.0
         print(f"[live_watch] watching checkpoints in {checkpoint_dir}")
 
         for episode in range(args.num_episodes):
             obs = env.reset(randomize=True)
+            env._max_steps = args.max_steps
             total_return = 0.0
-            for step in range(args.max_steps):
+            step = 0
+            while step < args.max_steps:
                 ckpt = latest_checkpoint(checkpoint_dir)
                 now = time.time()
                 if ckpt is not None and ckpt != last_checkpoint and (
                     last_checkpoint is None or now - last_reload_time >= args.reload_interval
                 ):
                     try:
+                        if ckpt != last_checkpoint:
+                            policy_args = apply_checkpoint_config(args, ckpt)
+                            policy = make_policy(policy_args, obs, device)
                         load_checkpoint(ckpt, policy, map_location=device)
                         policy.eval()
                         last_checkpoint = ckpt
@@ -78,11 +87,16 @@ def live_watch(args) -> None:
                         print(f"[live_watch] could not load checkpoint {ckpt}: {exc}")
                 with torch.no_grad():
                     chunk = policy.predict_action_chunk_from_obs(obs, device)
-                action = np.clip(chunk[0, 0].detach().cpu().numpy(), -1.0, 1.0)
-                obs, reward, done, info = env.step(action)
-                total_return += reward
-                if args.sleep > 0:
-                    time.sleep(args.sleep)
+                chunk_np = chunk[0].detach().cpu().numpy()
+                for chunk_step in range(min(args.exec_chunk_steps, chunk_np.shape[0])):
+                    action = np.clip(chunk_np[chunk_step], -1.0, 1.0)
+                    obs, reward, done, info = env.step(action)
+                    total_return += reward
+                    step += 1
+                    if args.sleep > 0:
+                        time.sleep(args.sleep)
+                    if done or step >= args.max_steps:
+                        break
                 if done:
                     break
             print(
@@ -117,6 +131,7 @@ def build_arg_parser():
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--diffusion_train_steps", type=int, default=100)
     parser.add_argument("--inference_steps", type=int, default=10)
+    parser.add_argument("--exec_chunk_steps", type=int, default=1)
     return parser
 
 

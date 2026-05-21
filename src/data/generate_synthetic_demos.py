@@ -27,9 +27,12 @@ def generate_synthetic_demos(
     max_steps: int = 150,
     seed: int = 0,
     noise_std: float = 0.02,
+    require_success: bool = False,
+    max_attempts: int | None = None,
 ) -> dict:
     seed_everything(seed)
     env = SyntheticFrankaGraspEnv(image_size=image_size, camera_name=camera_name)
+    env._max_steps = max_steps
     controller = ScriptedGraspController()
     output_path = Path(output_path)
     if output_path.exists():
@@ -37,8 +40,13 @@ def generate_synthetic_demos(
 
     success_count = 0
     try:
-        for episode_idx in range(num_episodes):
+        episode_idx = 0
+        attempts = 0
+        max_attempts = max_attempts or (num_episodes * (10 if require_success else 1))
+        while episode_idx < num_episodes and attempts < max_attempts:
+            attempts += 1
             obs = env.reset(randomize=True)
+            env._max_steps = max_steps
             controller.reset(obs)
             instruction = obs["instruction"]
             target_name = obs["object_state"]["target_name"]
@@ -64,6 +72,13 @@ def generate_synthetic_demos(
                     break
 
             success = bool(info.get("success", False))
+            if require_success and not success:
+                print(
+                    f"[generate] attempt={attempts} rejected "
+                    f"steps={len(buffers['actions'])} success=False"
+                )
+                continue
+
             success_count += int(success)
             episode = {
                 "images": np.asarray(buffers["images"], dtype=np.uint8),
@@ -84,17 +99,19 @@ def generate_synthetic_demos(
             }
             write_episode(output_path, episode_idx, episode)
             print(
-                f"[generate] episode={episode_idx + 1}/{num_episodes} "
+                f"[generate] episode={episode_idx + 1}/{num_episodes} attempt={attempts} "
                 f"steps={len(buffers['actions'])} success={success}"
             )
+            episode_idx += 1
     finally:
         env.close()
 
     stats = {
         "output_path": str(output_path),
-        "num_episodes": num_episodes,
+        "num_episodes": episode_idx,
+        "attempts": attempts,
         "success_count": success_count,
-        "success_rate": success_count / max(num_episodes, 1),
+        "success_rate": success_count / max(episode_idx, 1),
     }
     print(f"[generate] wrote {output_path} success_rate={stats['success_rate']:.3f}")
     return stats
@@ -109,6 +126,8 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=150)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--noise_std", type=float, default=0.02)
+    parser.add_argument("--require_success", action="store_true")
+    parser.add_argument("--max_attempts", type=int, default=None)
     args = parser.parse_args()
     generate_synthetic_demos(**vars(args))
 
